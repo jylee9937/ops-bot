@@ -1,0 +1,18 @@
+[
+  {
+    "id": "1007",
+    "title": "[inquiry] 저장 실패\nDETAIL: Key (email)=(kim@example.com) already exists.",
+    "culprit": "/inquiry",
+    "type": "default",
+    "level": "error",
+    "count": "3",
+    "userCount": 1,
+    "firstSeen": "2026-10-01T00:00:00Z",
+    "lastSeen": "2026-11-07T00:50:00Z",
+    "permalink": "https://sentry.io/organizations/example-org/issues/1007/",
+    "status": "unresolved",
+    "substatus": "regressed",
+    "issueCategory": "error",
+    "metadata": { "title": "[inquiry] 저장 실패\nDETAIL: Key (email)=(kim@example.com) already exists." }
+  }
+]

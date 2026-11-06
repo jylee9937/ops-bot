@@ -1,0 +1,47 @@
+{
+  "id": "abc123",
+  "message": "kim@example.com",
+  "tags": [{ "key": "user.email", "value": "kim@example.com" }],
+  "entries": [
+    { "type": "breadcrumbs", "data": { "values": [{ "message": "kim@example.com 로그인" }] } },
+    {
+      "type": "exception",
+      "data": {
+        "values": [
+          {
+            "type": "Error",
+            "value": "원인 예외",
+            "stacktrace": {
+              "frames": [{ "filename": "app/cause.ts", "function": "cause", "lineNo": 1, "inApp": true }]
+            }
+          },
+          {
+            "type": "TypeError",
+            "value": "kim@example.com 처리 실패",
+            "stacktrace": {
+              "frames": [
+                { "filename": "node_modules/next/server.js", "function": "run", "lineNo": 10, "inApp": false },
+                { "filename": "app/a1.ts", "function": "a1", "lineNo": 1, "inApp": true },
+                { "filename": "app/a2.ts", "function": "a2", "lineNo": 2, "inApp": true },
+                { "filename": "app/a3.ts", "function": "a3", "lineNo": 3, "inApp": true },
+                { "filename": "app/a4.ts", "function": "a4", "lineNo": 4, "inApp": true },
+                { "filename": "app/a5.ts", "function": "a5", "lineNo": 5, "inApp": true },
+                { "filename": "app/a6.ts", "function": "a6", "lineNo": 6, "inApp": true },
+                {
+                  "filename": "https://site.example/_next/static/app.js?dpl=secret-token",
+                  "absPath": "https://site.example/_next/static/app.js?dpl=secret-token",
+                  "function": "submit",
+                  "lineNo": 7,
+                  "colNo": 3,
+                  "inApp": true,
+                  "context": [[7, "const email = 'kim@example.com';"]],
+                  "vars": { "email": "kim@example.com" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

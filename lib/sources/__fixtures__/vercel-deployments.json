@@ -1,0 +1,82 @@
+{
+  "deployments": [
+    {
+      "uid": "dpl_ready",
+      "name": "example",
+      "url": "example-ready.vercel.app",
+      "created": 1793840000000,
+      "createdAt": 1793840000000,
+      "ready": 1793840100000,
+      "readyState": "READY",
+      "state": "READY",
+      "target": "production",
+      "type": "LAMBDAS",
+      "projectId": "prj_example",
+      "inspectorUrl": "https://vercel.com/example/example/ready",
+      "creator": { "uid": "user1", "email": "kim@example.com", "username": "kim" },
+      "meta": {
+        "githubCommitSha": "0123456789abcdef0123456789abcdef01234567",
+        "githubCommitRef": "main",
+        "githubCommitMessage": "홍길동 문의 수정 kim@example.com"
+      }
+    },
+    {
+      "uid": "dpl_failed",
+      "name": "example",
+      "url": "example-failed.vercel.app",
+      "created": "1793839000000",
+      "createdAt": 1793839000000,
+      "ready": 1793839200000,
+      "readyState": "ERROR",
+      "state": "ERROR",
+      "target": "production",
+      "type": "LAMBDAS",
+      "projectId": "prj_example",
+      "errorCode": "BUILD_FAILED",
+      "errorMessage": "홍길동 kim@example.com 010-1234-5678 빌드 실패",
+      "inspectorUrl": "https://vercel.com/example/example/failed",
+      "creator": { "uid": "user1", "email": "kim@example.com" },
+      "meta": { "githubCommitSha": "abcdef0", "githubCommitMessage": "홍길동 문의 수정" }
+    },
+    {
+      "id": "dpl_other_shape",
+      "name": "example",
+      "url": null,
+      "created": 1793838000000,
+      "state": "ERROR",
+      "target": "production",
+      "errorCode": "홍길동 kim@example.com",
+      "inspectorUrl": null,
+      "creator": { "uid": "user1" },
+      "meta": { "githubCommitSha": "not-a-sha" }
+    },
+    {
+      "uid": "dpl_building",
+      "created": 1793837000000,
+      "readyState": "BUILDING",
+      "target": "production",
+      "inspectorUrl": "https://vercel.com/example/example/building",
+      "creator": { "uid": "user1" }
+    },
+    {
+      "uid": "dpl_preview",
+      "created": 1793836000000,
+      "readyState": "ERROR",
+      "target": null,
+      "inspectorUrl": "https://vercel.com/example/example/preview",
+      "creator": { "uid": "user1" }
+    },
+    {
+      "uid": "dpl_no_created",
+      "readyState": "ERROR",
+      "target": "production",
+      "creator": { "uid": "user1" }
+    },
+    {
+      "created": 1793835000000,
+      "target": "production",
+      "creator": { "uid": "user1" }
+    }
+  ],
+  "pagination": { "count": 7, "next": null, "prev": 1793840000000 }
+}

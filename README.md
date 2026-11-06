@@ -32,7 +32,7 @@ Vercel webhook ─서명 검증─▶ ingest ◀─────┘
 ## 진행 상태
 
 - [x] 프로젝트 기반: Next.js, Vitest, CI, DB 스키마, 감시 대상 설정
-- [ ] 수집기와 마스킹
+- [x] 수집기와 마스킹
 - [ ] incident 규칙
 - [ ] Slack 알림과 버튼
 - [ ] collect와 heartbeat
