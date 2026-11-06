@@ -38,6 +38,9 @@ yarn-error.log*
 *.db
 *.db-*
 
+# local agent state
+.omc/
+
 # vercel
 .vercel
 
