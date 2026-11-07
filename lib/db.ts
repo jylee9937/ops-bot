@@ -55,6 +55,15 @@ const MIGRATIONS: readonly { version: number; statements: readonly string[] }[] 
         )`,
       ],
     },
+    {
+      version: 2,
+      statements: [
+        // 알림을 기다리기 시작한 시각. heartbeat의 '미전송 최장 대기'를 잰다.
+        `ALTER TABLE incidents ADD COLUMN pending_since TEXT`,
+        // 전송 중 표시. 전송 도중 함수가 죽어도 시간이 지나면 다시 보낸다.
+        `ALTER TABLE incidents ADD COLUMN notify_claimed_at TEXT`,
+      ],
+    },
   ];
 
 export function createDb(

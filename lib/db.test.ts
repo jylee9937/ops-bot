@@ -29,7 +29,7 @@ describe("migrate", () => {
   });
 
   it("빈 DB에 핵심 표를 만들고, 다시 실행해도 아무것도 하지 않는다", async () => {
-    expect(await migrate(db)).toEqual([1]);
+    expect(await migrate(db)).toEqual([1, 2]);
     expect(await migrate(db)).toEqual([]);
 
     const { rows } = await db.execute(
