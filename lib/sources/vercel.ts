@@ -103,6 +103,7 @@ export async function collectVercel(
         sha: sha && SHA.test(sha) ? sha : null,
         state,
         createdAt,
+        readyAt: ready == null ? null : new Date(ready).toISOString(),
       });
 
       if (state === "ERROR") {

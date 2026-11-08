@@ -29,7 +29,7 @@ describe("migrate", () => {
   });
 
   it("빈 DB에 핵심 표를 만들고, 다시 실행해도 아무것도 하지 않는다", async () => {
-    expect(await migrate(db)).toEqual([1]);
+    expect(await migrate(db)).toEqual([1, 2, 3]);
     expect(await migrate(db)).toEqual([]);
 
     const { rows } = await db.execute(
@@ -38,6 +38,25 @@ describe("migrate", () => {
     expect(rows.map((row) => row.name)).toEqual(
       expect.arrayContaining(["cursors", "deploys", "incidents", "locks", "mutes"]),
     );
+  });
+
+  it("v1 시절 열린 미전송 incident에 대기 시작 시각을 채운다", async () => {
+    await migrate(db, 1);
+    await insertIncident(db);
+    await db.execute({
+      sql: `INSERT INTO incidents (target, fingerprint, severity, area, title, first_seen, last_seen, notified_at)
+            VALUES ('site-a', 'fp-sent', 'P1', '인증', '전달함', ?, ?, ?)`,
+      args: [NOW, NOW, NOW],
+    });
+
+    expect(await migrate(db)).toEqual([2, 3]);
+
+    const { rows } = await db.execute(
+      "SELECT fingerprint, pending_since, version FROM incidents ORDER BY fingerprint",
+    );
+    expect(rows[0].fingerprint).toBe("fp");
+    expect(String(rows[0].pending_since)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(rows[1]).toMatchObject({ fingerprint: "fp-sent", pending_since: null, version: 0 });
   });
 
   it("같은 사이트의 같은 지문은 incident 하나만 허용한다", async () => {

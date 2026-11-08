@@ -93,6 +93,11 @@ export function maskFrame(frame: {
   };
 }
 
+/** DB에서 읽은 글자. 저장 칸은 MaskedText만 받으므로 다시 검사하지 않는다. 표를 읽을 때만 쓴다. */
+export function maskedFromStore(text: string): MaskedText {
+  return text as MaskedText;
+}
+
 /** 마스킹된 글자에서 `[태그]`의 이름을 꺼낸다. 영역 판단에 쓴다. */
 export function tagOf(text: MaskedText): MaskedText | null {
   const match = TAG.exec(text);
