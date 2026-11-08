@@ -129,6 +129,13 @@ describe("updateSnapshots", () => {
     expect(Object.keys(third.snapshots)).toHaveLength(2);
   });
 
+  it("같은 버킷에 더 작은 값이 와도 큰 값을 유지한다", () => {
+    const first = updateSnapshots(baselineSnapshots(0, at("01:00")), 6, at("01:01"));
+    const second = updateSnapshots(first.snapshots, 3, at("01:02"));
+    expect(second.snapshots["2026-11-07T01:00:00.000Z"]).toBe(6);
+    expect(second.increase).toBe(6);
+  });
+
   it("누적값이 줄어도 음수가 되지 않는다", () => {
     expect(updateSnapshots(baselineSnapshots(10, at("01:00")), 3, at("01:00")).increase).toBe(0);
   });

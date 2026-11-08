@@ -90,6 +90,7 @@ describe("collectVercel 정규화", () => {
         sha: "0123456789abcdef0123456789abcdef01234567",
         state: "READY",
         createdAt: new Date(1793840000000).toISOString(),
+        readyAt: new Date(1793840100000).toISOString(),
       },
       {
         target: "site-a",
@@ -97,6 +98,7 @@ describe("collectVercel 정규화", () => {
         sha: "abcdef0",
         state: "ERROR",
         createdAt: new Date(1793839000000).toISOString(),
+        readyAt: new Date(1793839200000).toISOString(),
       },
       {
         target: "site-a",
@@ -104,6 +106,7 @@ describe("collectVercel 정규화", () => {
         sha: null,
         state: "ERROR",
         createdAt: new Date(1793838000000).toISOString(),
+        readyAt: null,
       },
       {
         target: "site-a",
@@ -111,6 +114,7 @@ describe("collectVercel 정규화", () => {
         sha: null,
         state: "BUILDING",
         createdAt: new Date(1793837000000).toISOString(),
+        readyAt: null,
       },
     ]);
   });

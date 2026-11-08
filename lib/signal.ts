@@ -37,6 +37,8 @@ export type Deploy = {
   sha: string | null;
   state: string;
   createdAt: string;
+  // READY가 된 시각. ERROR면 실패한 시각이다.
+  readyAt: string | null;
 };
 
 export type SourceResult = {

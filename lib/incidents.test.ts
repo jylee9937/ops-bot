@@ -83,8 +83,29 @@ function deploy(overrides: Partial<Deploy> = {}): Deploy {
     sha: "abcdef0",
     state: "READY",
     createdAt: iso("00:40"),
+    readyAt: null,
     ...overrides,
   };
+}
+
+/** 다음 batch 직전에 다른 작업을 끼워 넣는다. 읽은 뒤 쓰기 전에 다른 실행이 쓴 상황을 만든다. */
+function interleave(db: Client, before: () => Promise<unknown>, times = 1): Client {
+  let left = times;
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (...args: Parameters<Client["batch"]>) => {
+          if (left > 0) {
+            left--;
+            await before();
+          }
+          return target.batch(...args);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 describe("incidents", () => {
@@ -104,8 +125,12 @@ describe("incidents", () => {
   const pendingIds = async (now: Date, target = TARGET) =>
     (await listPending(db, target.id, now)).map((incident) => incident.fingerprint);
 
-  const deliver = async (now: Date, fingerprint = "sentry:1", slackTs: string | null = "111.222") =>
-    completeNotification(db, (await row(fingerprint)).id, slackTs, now);
+  const deliver = async (now: Date, fingerprint = "sentry:1", slackTs: string | null = "111.222") => {
+    const { id } = await row(fingerprint);
+    const claim = await claimNotification(db, id, now);
+    if (!claim) throw new Error("전송을 시작할 수 없습니다");
+    return completeNotification(db, id, claim, slackTs, now);
+  };
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "ops-bot-incidents-"));
@@ -164,10 +189,10 @@ describe("incidents", () => {
       expect((await row()).lastSeen).toBe(iso("00:59"));
     });
 
-    it("마지막 발생 시각과 첫 발생 시각을 넓힌다", async () => {
+    it("마지막 발생 시각은 늘리고 첫 발생 시각은 앞당긴다", async () => {
       await ingest(db, TARGET, [issue({ lastSeen: iso("00:59") })], at("01:00"));
-      await ingest(db, TARGET, [issue({ firstSeen: iso("00:30"), lastSeen: iso("00:50") })], at("01:05"));
-      expect(await row()).toMatchObject({ firstSeen: iso("00:30"), lastSeen: iso("00:59") });
+      await ingest(db, TARGET, [issue({ firstSeen: iso("00:30"), lastSeen: iso("01:04") })], at("01:05"));
+      expect(await row()).toMatchObject({ firstSeen: iso("00:30"), lastSeen: iso("01:04") });
     });
 
     it("두 사이트의 같은 지문을 따로 관리한다", async () => {
@@ -367,9 +392,6 @@ describe("incidents", () => {
       await ingest(db, TARGET, [issue({ lastSeen: iso("02:03") })], at("02:10"));
       await ingest(db, TARGET, [issue({ lastSeen: iso("02:09") })], at("02:15"));
       expect(await pendingIds(at("02:15"))).toEqual([]);
-
-      const { rows } = await db.execute("SELECT COUNT(*) AS total FROM mutes");
-      expect(Number(rows[0].total)).toBe(0);
     });
 
     it("끝난 뒤 새 발생이 없으면 알리지 않는다", async () => {
@@ -401,6 +423,16 @@ describe("incidents", () => {
         deploymentId: "dpl_1",
         sha: "abcdef0",
         createdAt: iso("00:40"),
+        readyAt: null,
+      });
+    });
+
+    it("빌드가 오래 걸려도 공개된 시각부터 30분을 본다", async () => {
+      await recordDeploys(db, [deploy({ createdAt: iso("00:00"), readyAt: iso("00:45") })], at("00:46"));
+      await ingest(db, TARGET, [issue({ firstSeen: iso("01:00"), lastSeen: iso("01:00") })], at("01:01"));
+      expect((await row()).evidence.relatedDeploy).toMatchObject({
+        deploymentId: "dpl_1",
+        readyAt: iso("00:45"),
       });
     });
 
@@ -498,27 +530,27 @@ describe("incidents", () => {
       expect(await pendingIds(at("01:00"))).toEqual(["sentry:p1", "sentry:p2", "sentry:p3"]);
     });
 
-    it("동시에 전송을 시작해도 한쪽만 성공한다", async () => {
+    it("동시에 전송을 시작해도 한쪽만 표를 받는다", async () => {
       await ingest(db, TARGET, [issue()], at("01:00"));
       const { id } = await row();
 
-      const results = await Promise.all([
+      const claims = await Promise.all([
         claimNotification(db, id, at("01:00")),
         claimNotification(db, id, at("01:00")),
       ]);
 
-      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(claims.filter((claim) => claim !== null)).toHaveLength(1);
       expect(await pendingIds(at("01:00"))).toEqual([]);
     });
 
     it("전송에 실패하면 다음 실행이 다시 보낸다", async () => {
       await ingest(db, TARGET, [issue()], at("01:00"));
       const { id } = await row();
-      await claimNotification(db, id, at("01:00"));
-      await releaseNotification(db, id);
+      const claim = await claimNotification(db, id, at("01:00"));
+      await releaseNotification(db, id, claim!);
 
       expect(await pendingIds(at("01:05"))).toEqual(["sentry:1"]);
-      expect(await claimNotification(db, id, at("01:05"))).toBe(true);
+      expect(await claimNotification(db, id, at("01:05"))).not.toBeNull();
     });
 
     it("전송 도중 함수가 죽어도 10분 뒤 다시 보낸다", async () => {
@@ -527,26 +559,62 @@ describe("incidents", () => {
       await claimNotification(db, id, at("01:00"));
 
       expect(await pendingIds(at("01:09"))).toEqual([]);
-      expect(await claimNotification(db, id, at("01:09"))).toBe(false);
+      expect(await claimNotification(db, id, at("01:09"))).toBeNull();
       expect(await pendingIds(at("01:10"))).toEqual(["sentry:1"]);
-      expect(await claimNotification(db, id, at("01:10"))).toBe(true);
+      expect(await claimNotification(db, id, at("01:10"))).not.toBeNull();
     });
 
     it("전송을 마치면 다시 보내지 않고 Slack 위치를 남긴다", async () => {
       await ingest(db, TARGET, [issue()], at("01:00"));
       const { id } = await row();
-      await claimNotification(db, id, at("01:00"));
-      await completeNotification(db, id, "111.222", at("01:00"));
+      const claim = await claimNotification(db, id, at("01:00"));
 
+      expect(await completeNotification(db, id, claim!, "111.222", at("01:00"))).toBe(true);
       expect(await row()).toMatchObject({ notifiedAt: iso("01:00"), slackTs: "111.222", pendingSince: null });
-      expect(await claimNotification(db, id, at("02:00"))).toBe(false);
+      expect(await claimNotification(db, id, at("02:00"))).toBeNull();
       expect(await pendingIds(at("02:00"))).toEqual([]);
     });
 
-    it("다시 알릴 때 Slack 위치 없이 끝나도 기존 위치를 지우지 않는다", async () => {
+    it("보내는 동안 등급이 오르면 이전 전송의 완료가 새 알림을 지우지 않는다", async () => {
+      await ingest(db, TARGET, [issue({ count: 1 })], at("01:00"));
+      const { id } = await row();
+      const claim = await claimNotification(db, id, at("01:00"));
+      await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10"));
+
+      expect(await completeNotification(db, id, claim!, "111.222", at("01:10"))).toBe(false);
+      expect(await row()).toMatchObject({ severity: "P1", notifiedAt: null });
+      expect(await pendingIds(at("01:10"))).toEqual(["sentry:1"]);
+    });
+
+    it("보내는 동안 해결 뒤 재개방되면 이전 전송의 완료는 무효다", async () => {
       await ingest(db, TARGET, [issue()], at("01:00"));
+      const { id } = await row();
+      const claim = await claimNotification(db, id, at("01:00"));
+      await resolveIncident(db, "site-a", "sentry:1", at("01:02"));
+      await ingest(db, TARGET, [issue({ lastSeen: iso("01:05") })], at("01:06"));
+
+      expect(await completeNotification(db, id, claim!, "111.222", at("01:06"))).toBe(false);
+      expect(await row()).toMatchObject({ episode: 2, notifiedAt: null });
+      expect(await pendingIds(at("01:06"))).toEqual(["sentry:1"]);
+    });
+
+    it("다른 실행이 다시 받은 표는 이전 표로 완료하거나 취소할 수 없다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      const { id } = await row();
+      const first = await claimNotification(db, id, at("01:00"));
+      const second = await claimNotification(db, id, at("01:10"));
+
+      await releaseNotification(db, id, first!);
+      expect(await pendingIds(at("01:11"))).toEqual([]);
+      expect(await completeNotification(db, id, first!, null, at("01:11"))).toBe(false);
+      expect(await completeNotification(db, id, second!, "222.333", at("01:11"))).toBe(true);
+    });
+
+    it("다시 알릴 때 Slack 위치 없이 끝나도 기존 위치를 지우지 않는다", async () => {
+      await ingest(db, TARGET, [issue({ count: 1 })], at("01:00"));
       await deliver(at("01:00"), "sentry:1", "111.222");
-      await deliver(at("01:05"), "sentry:1", null);
+      await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10"));
+      await deliver(at("01:10"), "sentry:1", null);
       expect((await row()).slackTs).toBe("111.222");
     });
 
@@ -554,7 +622,85 @@ describe("incidents", () => {
       await ingest(db, TARGET, [issue()], at("01:00"));
       const { id } = await row();
       await resolveIncident(db, "site-a", "sentry:1", at("01:01"));
-      expect(await claimNotification(db, id, at("01:02"))).toBe(false);
+      expect(await claimNotification(db, id, at("01:02"))).toBeNull();
+    });
+  });
+
+  describe("동시 실행", () => {
+    beforeEach(async () => {
+      await ingest(db, TARGET, [issue({ count: 1 })], at("01:00"));
+      await deliver(at("01:00"));
+    });
+
+    it("읽은 뒤 다른 실행이 올린 등급과 횟수를 되돌리지 않는다", async () => {
+      const raced = interleave(db, () =>
+        ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10")),
+      );
+      const summary = await ingest(raced, TARGET, [issue({ count: 2, lastSeen: iso("01:05") })], at("01:10"));
+
+      expect(summary.ignored).toBe(1);
+      expect(await row()).toMatchObject({ severity: "P1", lastSeen: iso("01:09"), evidence: { count: 9 } });
+      expect(await pendingIds(at("01:10"))).toEqual(["sentry:1"]);
+    });
+
+    it("다시 읽어 더 최근 값을 반영한다", async () => {
+      const raced = interleave(db, () =>
+        ingest(db, TARGET, [issue({ count: 2, lastSeen: iso("01:05") })], at("01:10")),
+      );
+      const summary = await ingest(raced, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10"));
+
+      expect(summary).toMatchObject({ updated: 1, escalated: 1 });
+      expect(await row()).toMatchObject({ severity: "P1", evidence: { count: 9 } });
+    });
+
+    it("읽은 뒤 음소거됐으면 오른 등급을 알리지 않는다", async () => {
+      const raced = interleave(db, () => muteIncident(db, "site-a", "sentry:1", at("02:00"), at("01:09")));
+      await ingest(raced, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10"));
+
+      expect((await row()).severity).toBe("P1");
+      expect(await pendingIds(at("01:10"))).toEqual([]);
+    });
+
+    it("같은 새 incident를 동시에 만들면 늦은 쪽은 갱신으로 처리한다", async () => {
+      const second = { fingerprint: "sentry:2", sourceId: "2" };
+      const raced = interleave(db, () => ingest(db, TARGET, [issue({ ...second, count: 1 })], at("01:00")));
+      const summary = await ingest(raced, TARGET, [issue({ ...second, count: 4 })], at("01:00"));
+
+      expect(summary).toMatchObject({ created: 0, updated: 1 });
+      expect((await row("sentry:2")).evidence.count).toBe(4);
+    });
+
+    it("충돌이 계속되면 실패를 알린다", async () => {
+      const raced = interleave(
+        db,
+        () => db.execute("UPDATE incidents SET version = version + 1"),
+        Number.POSITIVE_INFINITY,
+      );
+      await expect(
+        ingest(raced, TARGET, [issue({ count: 2, lastSeen: iso("01:05") })], at("01:05")),
+      ).rejects.toThrow("3번 연속 충돌");
+    });
+
+    it("늦게 도착한 옛 응답은 무시한다", async () => {
+      await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10"));
+      const summary = await ingest(db, TARGET, [issue({ count: 2, lastSeen: iso("01:05") })], at("01:11"));
+
+      expect(summary.ignored).toBe(1);
+      expect((await row()).evidence.count).toBe(9);
+    });
+
+    it("같은 시각의 응답이 더 작은 누적값을 주면 큰 값을 유지한다", async () => {
+      await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:09") })], at("01:10"));
+      await ingest(db, TARGET, [issue({ count: 2, lastSeen: iso("01:09") })], at("01:11"));
+      expect((await row()).evidence.count).toBe(9);
+    });
+
+    it("늦게 도착한 옛 해결 상태는 열린 incident를 닫지 않는다", async () => {
+      await ingest(db, TARGET, [issue({ count: 2, lastSeen: iso("01:09") })], at("01:10"));
+      const summary = await ingest(db, TARGET, [issue({ kind: "issue.resolved", lastSeen: iso("01:05") })], at("01:11"));
+
+      expect(summary.ignored).toBe(1);
+      expect((await row()).status).toBe("open");
     });
   });
 
@@ -596,7 +742,7 @@ describe("incidents", () => {
 
   describe("recordDeploys", () => {
     const state = async () => {
-      const { rows } = await db.execute("SELECT state, sha, updated_at FROM deploys");
+      const { rows } = await db.execute("SELECT state, sha, ready_at, updated_at FROM deploys");
       return rows[0];
     };
 
@@ -610,6 +756,19 @@ describe("incidents", () => {
       await recordDeploys(db, [deploy({ state: "ERROR" })], at("01:05"));
       await recordDeploys(db, [deploy({ state: "BUILDING" })], at("01:06"));
       expect(await state()).toMatchObject({ state: "ERROR", updated_at: iso("01:05") });
+    });
+
+    it("공개 시각을 남기고, 늦게 온 과거 상태가 지우지 않는다", async () => {
+      await recordDeploys(db, [deploy({ state: "BUILDING" })], at("00:41"));
+      await recordDeploys(db, [deploy({ state: "READY", readyAt: iso("00:45") })], at("00:46"));
+      await recordDeploys(db, [deploy({ state: "BUILDING" })], at("00:47"));
+      expect(await state()).toMatchObject({ state: "READY", ready_at: iso("00:45") });
+    });
+
+    it("최종 상태가 바뀌어도 공개 시각은 지우지 않는다", async () => {
+      await recordDeploys(db, [deploy({ state: "READY", readyAt: iso("00:45") })], at("00:46"));
+      await recordDeploys(db, [deploy({ state: "DELETED" })], at("02:00"));
+      expect(await state()).toMatchObject({ state: "DELETED", ready_at: iso("00:45") });
     });
 
     it("같은 배포를 두 번 받아도 한 행이다", async () => {

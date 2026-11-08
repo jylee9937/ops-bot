@@ -84,14 +84,17 @@ export function updateSnapshots(
 ): { snapshots: CountSnapshots; increase: number } {
   const bucket = bucketOf(now.getTime());
   const cutoff = bucket - ESCALATION_WINDOW_MS;
-  const entries = Object.entries({ ...snapshots, [new Date(bucket).toISOString()]: count }).sort(
-    ([a], [b]) => Date.parse(a) - Date.parse(b),
-  );
+  const key = new Date(bucket).toISOString();
+  // 누적값은 줄지 않는다. 늦게 도착한 옛 값이 더 큰 값을 덮어쓰지 않게 한다.
+  const entries = Object.entries({
+    ...snapshots,
+    [key]: Math.max(snapshots[key] ?? 0, count),
+  }).sort(([a], [b]) => Date.parse(a) - Date.parse(b));
 
   const baselineIndex = entries.findLastIndex(([key]) => Date.parse(key) <= cutoff);
   const kept = entries.slice(Math.max(baselineIndex, 0));
   return {
     snapshots: Object.fromEntries(kept),
-    increase: Math.max(0, count - kept[0][1]),
+    increase: Math.max(0, (kept.at(-1)?.[1] ?? count) - kept[0][1]),
   };
 }
