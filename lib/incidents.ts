@@ -1,6 +1,7 @@
 import type { Client, InStatement, Row } from "@libsql/client";
 import { createDb, migrate } from "./db";
-import { maskedFromStore, type MaskedText } from "./mask";
+import type { Analysis } from "./analysis";
+import { maskedFromStore, type MaskedFrame, type MaskedText } from "./mask";
 import {
   baselineSnapshots,
   classify,
@@ -22,6 +23,7 @@ const DELIVERY_OVERDUE_MS = 15 * 60_000;
 // collect route의 maxDuration(120초)보다 길고 Cron 주기(5분)보다 짧다. 함수가 죽어 잠금이 남아도 다음 회차는 돈다.
 const LOCK_TTL_MS = 3 * 60_000;
 const RETENTION_MS = 180 * 24 * 60 * 60_000;
+const KST_OFFSET_MS = 9 * 60 * 60_000;
 const MAX_INGEST_ATTEMPTS = 3;
 
 // 이 상태가 된 배포는 늦게 도착한 과거 상태로 되돌리지 않는다.
@@ -59,6 +61,19 @@ export type Evidence = {
   relatedDeploy: RelatedDeploy | null;
 };
 
+/**
+ * 상세 알림을 보낼 때 모은 보조 정보. `key`(회차:등급)가 지금과 같고 `result`가 있으면 Claude를 다시 부르지 않는다.
+ * 글자는 마스킹된 값(frames)·설정의 사이트 id(correlated)·Claude 답(result)이다.
+ */
+export type StoredAnalysis = {
+  key: string;
+  result: Analysis | null;
+  model: string | null;
+  frames: MaskedFrame[];
+  correlated: string[];
+  at: string;
+};
+
 export type Incident = {
   id: number;
   target: string;
@@ -76,6 +91,7 @@ export type Incident = {
   resolvedAt: string | null;
   pendingSince: string | null;
   version: number;
+  analysis: StoredAnalysis | null;
 };
 
 export type IngestSummary = {
@@ -116,6 +132,8 @@ function toIncident(row: Row): Incident {
     resolvedAt: nullableString(row.resolved_at),
     pendingSince: nullableString(row.pending_since),
     version: Number(row.version),
+    // 마이그레이션 4 전에 읽은 행에는 칸이 없다.
+    analysis: row.analysis == null ? null : JSON.parse(String(row.analysis)),
   };
 }
 
@@ -626,6 +644,36 @@ export async function isDeliveryOverdue(
   return rows.length > 0;
 }
 
+/**
+ * 상세 알림의 보조 정보를 남긴다. 알림 상태·버전과 무관한 칸이라 버전을 올리지 않는다.
+ * 전송 표를 쥔 동안에만 쓴다. 요약을 만드는 사이 등급이 올라 다른 실행이 새 요약을 저장했으면 덮어쓰지 않는다.
+ */
+export async function saveAnalysis(
+  db: Client,
+  id: number,
+  claim: string,
+  analysis: StoredAnalysis,
+): Promise<boolean> {
+  const result = await db.execute({
+    sql: "UPDATE incidents SET analysis = ? WHERE id = ? AND notify_claim = ?",
+    args: [JSON.stringify(analysis), id, claim],
+  });
+  return result.rowsAffected > 0;
+}
+
+/** 하루(KST) Claude 호출 한 칸을 예약한다. 상한에 닿았으면 false. 동시에 불려도 한 칸씩만 늘어난다. */
+export async function reserveAnalysisCall(db: Client, now: Date, limit: number): Promise<boolean> {
+  if (limit <= 0) return false;
+  const day = new Date(now.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
+  const { rows } = await db.execute({
+    sql: `INSERT INTO analysis_usage (day, calls) VALUES (?, 1)
+          ON CONFLICT (day) DO UPDATE SET calls = calls + 1 WHERE calls < ?
+          RETURNING calls`,
+    args: [day, limit],
+  });
+  return rows.length > 0;
+}
+
 /** 같은 시각 다른 사이트에도 에러가 있었는지. incident는 합치지 않고 메시지에만 표시한다. */
 export async function findCorrelatedTargets(
   db: Client,
@@ -743,6 +791,7 @@ export async function purgeExpired(db: Client, now: Date): Promise<void> {
       { sql: "DELETE FROM deploys WHERE created_at < ?", args: [cutoff] },
       { sql: "DELETE FROM mutes WHERE until < ?", args: [cutoff] },
       { sql: "DELETE FROM locks WHERE expires_at < ?", args: [now.toISOString()] },
+      { sql: "DELETE FROM analysis_usage WHERE day < ?", args: [cutoff.slice(0, 10)] },
     ],
     "write",
   );

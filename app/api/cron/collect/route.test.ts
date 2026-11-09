@@ -80,7 +80,8 @@ describe("GET /api/cron/collect", () => {
       heartbeat: "disabled",
     });
     expect(JSON.stringify(body)).not.toContain("비밀 제목");
-    expect(requests.sort()).toEqual(["api.vercel.com", "sentry.io", "sentry.io", "slack.com"]);
+    // Sentry: issue 목록·해결 확인·알림 보낼 incident의 최신 이벤트(스택)
+    expect(requests.sort()).toEqual(["api.vercel.com", "sentry.io", "sentry.io", "sentry.io", "slack.com"]);
   });
 
   // Headers는 값 앞뒤 공백을 지우므로(Fetch 표준) 공백 대신 글자를 더한 값으로 확인한다

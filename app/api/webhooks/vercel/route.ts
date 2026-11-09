@@ -48,7 +48,7 @@ export async function POST(request: Request): Promise<Response> {
   let db: ReturnType<typeof openDb> | undefined;
   try {
     db = openDb();
-    const result = await handleDeployFailure(parsed.target, parsed.signal, { db, slack: env.slack, startedAt });
+    const result = await handleDeployFailure(parsed.target, parsed.signal, { db, slack: env.slack, startedAt, sites: env.targets });
     const delivery = result.deliveryError ? reasonOf(result.deliveryError) : "ok";
     if (result.deliveryError) console.error(`[webhooks/vercel] ${parsed.target.id} Slack 전송 실패: ${delivery}`);
     console.info(`[webhooks/vercel] ${parsed.target.id} 배포 실패 처리 · 전송 ${result.delivered.detailed}건`);

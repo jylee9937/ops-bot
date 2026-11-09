@@ -1,8 +1,10 @@
 import type { Client } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import Anthropic from "@anthropic-ai/sdk";
 import { createTestDb } from "./__fixtures__/test-db";
+import { DAILY_ANALYSIS_LIMIT, type ClaudeClient } from "./analysis";
 import { reasonOf, rotate, runCollect, STATUS_CHECK_LIMIT, type CollectDeps } from "./collect";
-import { acquireLock, getCursor, ingest, listPending } from "./incidents";
+import { acquireLock, getCursor, ingest, listPending, reserveAnalysisCall } from "./incidents";
 import { maskLogMessage } from "./mask";
 import { SlackError } from "./slack";
 import { SourceError } from "./sources/shared";
@@ -59,6 +61,7 @@ function world() {
     sentryStatus: {} as Record<string, string | number>,
     deployments: [] as unknown[],
     fail: {} as { sentry?: number; vercel?: number; slack?: string; heartbeat?: number },
+    sentryEvents: {} as Record<string, unknown>,
   };
   const calls: string[] = [];
   const slack: { channel: string; text: string; body: string }[] = [];
@@ -75,6 +78,11 @@ function world() {
       if (url.pathname.endsWith("/issues/")) {
         calls.push("sentry:list");
         return state.fail.sentry ? json({}, state.fail.sentry) : json(state.sentryIssues);
+      }
+      const event = /\/issues\/([^/]+)\/events\/latest\/$/.exec(url.pathname)?.[1];
+      if (event !== undefined) {
+        calls.push(`sentry:event:${event}`);
+        return json(state.sentryEvents[event] ?? {});
       }
       const id = /\/issues\/([^/]+)\/$/.exec(url.pathname)?.[1] ?? "";
       calls.push(`sentry:status:${id}`);
@@ -115,6 +123,7 @@ describe("runCollect", () => {
     vercel: { teamId: "team_test", token: "vercel-test-token" },
     slack: { token: "xoxb-test-token", ownerUserId: "U0OWNER1" },
     heartbeatUrl: HEARTBEAT,
+    anthropicApiKey: null,
     fetchImpl: w.impl,
     sleep: async () => {},
     now: () => at(time),
@@ -135,7 +144,7 @@ describe("runCollect", () => {
       { target: "site-a", step: "slack", ok: true },
     ]);
     expect(result.ingested.created).toBe(2);
-    expect(result.delivered).toEqual({ detailed: 2, bundled: 0, skipped: 0 });
+    expect(result.delivered).toEqual({ detailed: 2, bundled: 0, skipped: 0, analyzed: 0, analysisFailed: 0 });
     expect(w.slack.map((m) => m.channel)).toEqual(["#ops-a", "#ops-a"]);
     expect(w.slack[0].text).toContain("[P1][사이트 A] 배포 실패 (BUILD_FAILED)");
     expect(result.heartbeat).toBe("sent");
@@ -190,7 +199,7 @@ describe("runCollect", () => {
       { target: "site-a", step: "slack", ok: true },
     ]);
     // 수집이 실패했으니 Sentry 해결 확인도 하지 않는다
-    expect(w.calls.filter((c) => c.startsWith("sentry:status"))).toEqual([]);
+    expect(w.calls.filter((c) => c.startsWith("sentry:status") || c.startsWith("sentry:event"))).toEqual([]);
     expect(w.slack).toHaveLength(1);
     expect(await getCursor(db, "site-a", "sentry")).toBeNull();
     expect(result.heartbeat).toBe("skipped");
@@ -331,7 +340,7 @@ describe("runCollect", () => {
     );
     w.state.sentryStatus = { "..": 404, x: 404 };
     await runCollect(deps("01:05"));
-    expect(w.calls.filter((c) => c.startsWith("sentry:status"))).toEqual([]);
+    expect(w.calls.filter((c) => c.startsWith("sentry:status") || c.startsWith("sentry:event"))).toEqual([]);
     const { rows } = await db.execute("SELECT status FROM incidents WHERE fingerprint = 'sentry:../x'");
     expect(rows[0].status).toBe("open");
   });
@@ -448,6 +457,106 @@ describe("runCollect", () => {
     expect(result.heartbeat).toBe("skipped");
     expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
   });
+
+  describe("Claude 요약", () => {
+    const ANSWER = {
+      summary: "칼럼 목록 조회 쿼리가 실패하고 있습니다.",
+      suspectedLayer: "DB",
+      deployRelated: false,
+      crossSite: false,
+      userImpact: "칼럼 목록이 보이지 않습니다.",
+      nextChecks: ["쿼리 오류 로그 확인"],
+      confidence: "중간",
+    };
+
+    /** Claude API 대신 쓰는 가짜. 받은 요청을 남긴다. */
+    function claude(reply: () => unknown) {
+      const requests: { system: string; messages: { content: string }[] }[] = [];
+      const client = {
+        beta: {
+          messages: {
+            create: async (params: (typeof requests)[number]) => {
+              requests.push(params);
+              return reply();
+            },
+          },
+        },
+      } as unknown as ClaudeClient;
+      return { client, requests };
+    }
+    const answered = () => ({
+      model: "claude-opus-5-5",
+      stop_reason: "end_turn",
+      content: [{ type: "text", text: JSON.stringify(ANSWER) }],
+    });
+
+    beforeEach(() => {
+      w.state.sentryIssues = [sentryIssue("101")];
+      w.state.sentryEvents["101"] = {
+        entries: [
+          {
+            type: "exception",
+            data: {
+              values: [
+                {
+                  type: "Error",
+                  stacktrace: {
+                    frames: [
+                      { filename: "node_modules/x.js", function: "run", lineNo: 1, inApp: false },
+                      { filename: "src/entities/article/api/queries.ts", function: "listArticles", lineNo: 67, inApp: true },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    });
+
+    it("키가 있으면 알림에 요약을 붙이고 최신 이벤트의 스택을 근거로 넘긴다", async () => {
+      const { client, requests } = claude(answered);
+      const result = await runCollect(deps("01:00", { anthropicApiKey: "test-key", claude: client }));
+
+      expect(result.delivered).toMatchObject({ detailed: 1, analyzed: 1, analysisFailed: 0 });
+      expect(requests).toHaveLength(1);
+      expect(requests[0].messages[0].content).toContain("src/entities/article/api/queries.ts");
+      expect(requests[0].messages[0].content).not.toContain("node_modules/x.js");
+      expect(w.calls).toContain("sentry:event:101");
+      expect(w.slack[0].body).toContain("칼럼 목록 조회 쿼리가 실패하고 있습니다.");
+      expect(w.slack[0].body).toContain("위치 src/entities/article/api/queries.ts:67 (listArticles)");
+      expect(result.heartbeat).toBe("sent");
+    });
+
+    it("하루 상한에 닿았으면 Claude를 부르지 않고 템플릿으로 보낸다", async () => {
+      for (let i = 0; i < DAILY_ANALYSIS_LIMIT; i++) await reserveAnalysisCall(db, at("00:00"), DAILY_ANALYSIS_LIMIT);
+      const { client, requests } = claude(answered);
+
+      const result = await runCollect(deps("01:00", { anthropicApiKey: "test-key", claude: client }));
+      expect(requests).toEqual([]);
+      expect(result.delivered).toMatchObject({ detailed: 1, analyzed: 0, analysisFailed: 1 });
+      expect(w.slack[0].body).toContain("요약 없음 · 하루 상한");
+      expect(result.heartbeat).toBe("sent");
+    });
+
+    it("키가 틀려도 수집·알림·heartbeat는 그대로고 알림에 드러난다", async () => {
+      const { client } = claude(() => {
+        throw new Anthropic.AuthenticationError(401, undefined, "invalid x-api-key", new Headers());
+      });
+
+      const result = await runCollect(deps("01:00", { anthropicApiKey: "wrong-key", claude: client }));
+      expect(result.steps.every(({ ok }) => ok)).toBe(true);
+      expect(w.slack[0].body).toContain("요약 없음 · API 키 확인 필요");
+      expect(result.heartbeat).toBe("sent");
+    });
+
+    it("키가 없으면 Claude를 부르지 않는다", async () => {
+      const { client, requests } = claude(answered);
+      const result = await runCollect(deps("01:00", { anthropicApiKey: null, claude: client }));
+      expect(requests).toEqual([]);
+      expect(result.delivered).toMatchObject({ detailed: 1, analyzed: 0, analysisFailed: 0 });
+    });
+  });
 });
 
 describe("rotate", () => {
@@ -468,4 +577,5 @@ describe("reasonOf", () => {
     expect(reasonOf(new Error("libsql://secret-url token=abc"))).toBe("internal");
     expect(reasonOf("문자열 오류")).toBe("internal");
   });
+
 });

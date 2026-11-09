@@ -10,8 +10,10 @@ import {
   resolveIncident,
   type Incident,
 } from "./incidents";
-import { maskLogMessage, tagOf } from "./mask";
+import type { Analysis, AnalysisInput, AnalysisOutcome, Analyzer } from "./analysis";
+import { maskFrame, maskLogMessage, tagOf, type MaskedFrame } from "./mask";
 import {
+  ANALYSIS_SEND_RESERVE_MS,
   bundleMessage,
   deliverPending,
   DETAIL_LIMIT,
@@ -29,6 +31,33 @@ const at = (time: string) => new Date(`2026-11-07T${time}:00.000Z`);
 const iso = (time: string) => at(time).toISOString();
 const OWNER = "U0OWNER1";
 const NO_WAIT = { sleep: async () => {} };
+const OTHER: Target = {
+  id: "site-b",
+  name: "사이트 B",
+  vercel: { projectId: "prj_b", productionBranch: "main" },
+  slackChannel: "#ops-b",
+  areas: [],
+};
+const SUMMARY: Analysis = {
+  summary: "공개 목록 조회가 DB 시간 초과로 실패합니다.",
+  suspectedLayer: "DB",
+  deployRelated: false,
+  crossSite: false,
+  userImpact: "목록이 비어 보입니다.",
+  nextChecks: ["쿼리 지연 확인", "연결 수 확인"],
+  confidence: "중간",
+};
+
+/** 받은 근거를 기록하고 정해진 결과를 돌려주는 가짜 분석기. */
+function analyzerOf(result: AnalysisOutcome | ((input: AnalysisInput) => Promise<AnalysisOutcome>)) {
+  const inputs: AnalysisInput[] = [];
+  const analyzer: Analyzer = async (input) => {
+    inputs.push(input);
+    return typeof result === "function" ? result(input) : result;
+  };
+  return { analyzer, inputs };
+}
+const OK: AnalysisOutcome = { ok: true, analysis: SUMMARY, model: "claude-opus-5-5" };
 
 const TARGET: Target = {
   id: "site-a",
@@ -335,7 +364,7 @@ describe("report", () => {
 
       const result = await deliverPending(db, TARGET, at("01:01"), send, { ownerUserId: OWNER, ...NO_WAIT });
 
-      expect(result).toEqual({ detailed: 5, bundled: 1, skipped: 0, error: null });
+      expect(result).toEqual({ detailed: 5, analyzed: 0, analysisFailures: [], bundled: 1, skipped: 0, error: null });
       expect(sent).toHaveLength(6);
       // P1이 먼저 나가고 담당자를 멘션한다
       expect(sent[0].text).toBe(`<@${OWNER}> [P1][사이트 A] [auth] 조회 실패 6 ×1 (10분)`);
@@ -673,4 +702,204 @@ describe("report", () => {
     });
   });
 
+  describe("Claude 요약·스택·동시 장애", () => {
+    const deployFailure = () =>
+      issue(1, "articles", {
+        source: "vercel",
+        kind: "deploy.failed",
+        fingerprint: "vercel:dpl_1:ERROR",
+        sourceId: "dpl_1",
+        title: maskLogMessage("배포 실패 (BUILD_FAILED)"),
+        tag: null,
+        link: "https://vercel.com/team/project/1",
+      });
+
+    it("요약을 제목 아래에 붙이고, 모델이 쓴 멘션·링크 문법은 글자로 바꾼다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { analyzer, inputs } = analyzerOf({
+        ok: true,
+        model: "claude-opus-5-5",
+        analysis: { ...SUMMARY, summary: "<!channel> 확인 필요 <https://evil.example|여기>", nextChecks: ["<@U123> 호출"] },
+      });
+      const { sent, send } = recorder();
+
+      const result = await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, analyzer });
+
+      expect(result).toMatchObject({ detailed: 1, analyzed: 1, analysisFailures: [] });
+      const text = allText(sent[0]);
+      expect(text).not.toContain("<!channel>");
+      expect(text).not.toContain("<https://evil.example");
+      expect(text).not.toContain("<@U123>");
+      expect(text).toContain("&lt;!channel&gt; 확인 필요");
+      expect(text).toContain("의심 계층 DB · 신뢰도 중간");
+      expect(text).toContain("1) &lt;@U123&gt; 호출");
+      expect(text).toContain("요약: Claude · 참고용");
+      // 제목·근거·버튼은 그대로다
+      expect(sent[0].text).toBe("[P2][사이트 A] [articles] 조회 실패 1 ×1 (10분)");
+      expect(actionsOf(sent[0]).map((a) => a.action_id)).toEqual(["open_link", "resolve", "mute_1h", "mute_30d"]);
+
+      // 근거는 마스킹된 값과 설정값만 넘긴다
+      expect(inputs).toHaveLength(1);
+      expect(inputs[0]).toMatchObject({
+        site: "사이트 A",
+        severity: "P2",
+        area: "공개 조회",
+        title: maskLogMessage("[articles] 조회 실패 1"),
+        frames: [],
+        relatedDeploy: null,
+        otherSitesWithErrors: [],
+      });
+      expect((await byFingerprint("sentry:1")).analysis).toMatchObject({ key: "1:P2", model: "claude-opus-5-5" });
+    });
+
+    it("Claude가 실패하면 템플릿으로 보내고 이유를 적는다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { analyzer } = analyzerOf({ ok: false, reason: "timeout" });
+      const { sent, send } = recorder();
+
+      const result = await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, analyzer });
+
+      expect(result).toMatchObject({ detailed: 1, analyzed: 0, analysisFailures: ["timeout"], error: null });
+      expect(allText(sent[0])).toContain("요약 없음 · 응답 시간 초과");
+      expect(allText(sent[0])).not.toContain("의심 계층");
+      expect(await listPending(db, TARGET.id, at("01:02"))).toEqual([]);
+    });
+
+    it("분석기가 없으면(키 없음·webhook) 요약 줄 없이 보낸다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { sent, send } = recorder();
+      await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT);
+      expect(allText(sent[0])).not.toContain("요약");
+    });
+
+    it("배포 실패는 요약할 오류 문구가 없어 부르지 않는다", async () => {
+      await ingest(db, TARGET, [deployFailure()], at("01:00"));
+      const { analyzer, inputs } = analyzerOf(OK);
+      const { sent, send } = recorder();
+
+      const result = await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, analyzer });
+      expect(result).toMatchObject({ detailed: 1, analyzed: 0, analysisFailures: [] });
+      expect(inputs).toEqual([]);
+      expect(allText(sent[0])).not.toContain("요약");
+    });
+
+    it("전송이 실패한 뒤 다시 보낼 때는 저장된 요약을 쓰고, 등급이 오르면 새로 만든다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { analyzer, inputs } = analyzerOf(OK);
+
+      const down = recorder(() => true);
+      await deliverPending(db, TARGET, at("01:01"), down.send, { ...NO_WAIT, analyzer });
+      const up = recorder();
+      await deliverPending(db, TARGET, at("01:06"), up.send, { ...NO_WAIT, analyzer });
+      expect(inputs).toHaveLength(1);
+      expect(allText(up.sent[0])).toContain("의심 계층 DB");
+
+      // 10분 안에 5번 늘어 P1로 오른다 → 다른 등급이라 다시 분석한다
+      await ingest(db, TARGET, [issue(1, "articles", { count: 6, lastSeen: iso("01:07") })], at("01:07"));
+      expect((await byFingerprint("sentry:1")).severity).toBe("P1");
+      const again = recorder();
+      await deliverPending(db, TARGET, at("01:08"), again.send, { ...NO_WAIT, analyzer });
+      expect(inputs).toHaveLength(2);
+      expect(inputs[1].severity).toBe("P1");
+      expect((await byFingerprint("sentry:1")).analysis?.key).toBe("1:P1");
+    });
+
+    it("실행 시간이 모자라면 부르지 않고 템플릿으로 보낸다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { analyzer, inputs } = analyzerOf(OK);
+      const { sent, send } = recorder();
+      // 새 전송은 할 수 있지만 Claude 제한 시간 + 전송 몫은 남지 않았다
+      const shouldStop = (afterMs = 0) => afterMs > ANALYSIS_SEND_RESERVE_MS;
+
+      const result = await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, analyzer, shouldStop });
+      expect(inputs).toEqual([]);
+      expect(result.analysisFailures).toEqual(["no_time"]);
+      expect(allText(sent[0])).toContain("요약 없음 · 실행 시간 부족");
+    });
+
+    it("상세 알림의 요약을 동시에 만든 뒤 보낸다", async () => {
+      await ingest(db, TARGET, [issue(1), issue(2), issue(3)], at("01:00"));
+      let active = 0;
+      let maxActive = 0;
+      const events: string[] = [];
+      const { analyzer } = analyzerOf(async () => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        active--;
+        events.push("analyzed");
+        return OK;
+      });
+      const send: Send = async () => {
+        events.push("sent");
+        return { ts: "1.1" };
+      };
+
+      await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, analyzer });
+      expect(maxActive).toBe(3);
+      expect(events).toEqual(["analyzed", "analyzed", "analyzed", "sent", "sent", "sent"]);
+    });
+
+    it("Sentry incident는 호출 지점 프레임을 적는다. 스택 조회가 실패해도 보낸다", async () => {
+      await ingest(db, TARGET, [issue(1), deployFailure()], at("01:00"));
+      const asked: string[] = [];
+      const frame: MaskedFrame = maskFrame({ filename: "src/entities/article/api/queries.ts", function: "listArticles", line: 67 });
+      const { analyzer, inputs } = analyzerOf(OK);
+      const { sent, send } = recorder();
+
+      await deliverPending(db, TARGET, at("01:01"), send, {
+        ...NO_WAIT,
+        analyzer,
+        frames: async (incident) => {
+          asked.push(incident.fingerprint);
+          return [frame];
+        },
+      });
+      expect(asked).toEqual(["sentry:1"]);
+      expect(inputs[0].frames).toEqual([frame]);
+      const sentry = sent.find((m) => m.text.includes("조회 실패 1"));
+      expect(allText(sentry!)).toContain("위치 src/entities/article/api/queries.ts:67 (listArticles)");
+
+      await ingest(db, TARGET, [issue(2)], at("01:02"));
+      const broken = recorder();
+      const result = await deliverPending(db, TARGET, at("01:03"), broken.send, {
+        ...NO_WAIT,
+        frames: async () => {
+          throw new Error("Sentry 장애");
+        },
+      });
+      expect(result).toMatchObject({ detailed: 1, error: null });
+      expect(allText(broken.sent[0])).not.toContain("위치");
+    });
+
+    it("같은 시각 다른 사이트에도 에러가 있으면 이름과 상태 페이지를 붙이고 근거로 넘긴다", async () => {
+      await ingest(db, OTHER, [issue(7, "articles", { target: "site-b", lastSeen: iso("00:57") })], at("01:00"));
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { analyzer, inputs } = analyzerOf(OK);
+      const { sent, send } = recorder();
+
+      await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, analyzer, sites: [TARGET, OTHER] });
+      const text = allText(sent[0]);
+      expect(text).toContain("같은 시각 다른 사이트도 에러: 사이트 B · 플랫폼 문제일 수 있음");
+      expect(text).toContain("<https://www.vercel-status.com|Vercel 상태>");
+      expect(text).toContain("<https://status.supabase.com|Supabase 상태>");
+      expect(inputs[0].otherSitesWithErrors).toEqual(["사이트 B"]);
+
+      // 버튼을 누른 뒤 다시 그려도 요약과 동시 장애 줄이 남는다
+      const incident = await byFingerprint("sentry:1");
+      const response = await handleAction(db, [TARGET, OTHER], interaction(incident), at("02:00"));
+      expect(JSON.stringify(response)).toContain("의심 계층 DB");
+      expect(JSON.stringify(response)).toContain("같은 시각 다른 사이트도 에러: 사이트 B");
+      expect(JSON.stringify(response)).not.toContain("요약: Claude");
+    });
+
+    it("설정에서 빠진 사이트는 이름을 모르니 적지 않는다", async () => {
+      await ingest(db, OTHER, [issue(7, "articles", { target: "site-b", lastSeen: iso("00:57") })], at("01:00"));
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { sent, send } = recorder();
+
+      await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, sites: [TARGET] });
+      expect(allText(sent[0])).not.toContain("같은 시각");
+    });
+  });
 });

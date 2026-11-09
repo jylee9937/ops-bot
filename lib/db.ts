@@ -78,6 +78,18 @@ const MIGRATIONS: readonly { version: number; statements: readonly string[] }[] 
         `ALTER TABLE deploys ADD COLUMN ready_at TEXT`,
       ],
     },
+    {
+      version: 4,
+      statements: [
+        // 상세 알림을 보낼 때 만든 Claude 요약·스택·같은 시각 다른 사이트. 버튼을 누른 뒤 다시 그릴 때도 쓴다.
+        `ALTER TABLE incidents ADD COLUMN analysis TEXT`,
+        // Claude 하루 호출 수(KST 날짜). 실행이 달라도 함께 센다.
+        `CREATE TABLE analysis_usage (
+          day TEXT PRIMARY KEY,
+          calls INTEGER NOT NULL
+        )`,
+      ],
+    },
   ];
 
 export function createDb(

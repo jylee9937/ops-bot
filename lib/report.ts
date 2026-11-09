@@ -1,16 +1,27 @@
 import type { Client } from "@libsql/client";
 import {
+  ANALYSIS_TIMEOUT_MS,
+  type Analysis,
+  type AnalysisFailure,
+  type AnalysisInput,
+  type Analyzer,
+} from "./analysis";
+import {
   claimPending,
   completeNotification,
   completeNotifications,
+  findCorrelatedTargets,
   getClaimedIncident,
   getIncident,
   listClaimed,
   muteIncident,
   releaseClaim,
   resolveIncident,
+  saveAnalysis,
   type Incident,
+  type StoredAnalysis,
 } from "./incidents";
+import type { MaskedFrame } from "./mask";
 import { windowIncrease } from "./rules";
 import {
   escapeSlack,
@@ -38,6 +49,24 @@ export const MUTE_LONG_MS = 30 * 24 * 60 * 60_000;
 export const SEND_INTERVAL_MS = 1_100;
 /** Slack이 알려 준 대기 시간이 이보다 길면 기다리지 않고 다음 실행에 맡긴다. */
 export const MAX_RETRY_WAIT_MS = 10_000;
+/** Claude 호출을 시작하려면 호출 제한 시간에 더해 이만큼 남아 있어야 한다(상세·묶음 전송 몫). */
+export const ANALYSIS_SEND_RESERVE_MS = 15_000;
+/** 두 사이트가 함께 쓰는 플랫폼의 상태 페이지. 같은 시각 다른 사이트에도 에러가 있으면 붙인다(D22). */
+export const STATUS_PAGES = [
+  { name: "Vercel 상태", url: "https://www.vercel-status.com" },
+  { name: "Supabase 상태", url: "https://status.supabase.com" },
+] as const;
+
+const FAILURE_LABEL: Record<AnalysisFailure, string> = {
+  run_limit: "실행당 상한",
+  daily_limit: "하루 상한",
+  no_time: "실행 시간 부족",
+  timeout: "응답 시간 초과",
+  refusal: "응답 거절",
+  invalid_response: "응답 형식 오류",
+  auth: "API 키 확인 필요",
+  api_error: "API 오류",
+};
 
 const SECTION_LIMIT = 3_000;
 const MAX_LINK_LENGTH = 1_000;
@@ -93,11 +122,44 @@ function reason(incident: Incident): string {
   return "새 에러";
 }
 
+/** 이 회차·등급에서 만든 보조 정보만 쓴다. 그 뒤 등급이 오르거나 다시 열리면 새로 만든다. */
+export function analysisKey(incident: Pick<Incident, "episode" | "severity">): string {
+  return `${incident.episode}:${incident.severity}`;
+}
+
+function currentAnalysis(incident: Incident): StoredAnalysis | null {
+  return incident.analysis && incident.analysis.key === analysisKey(incident) ? incident.analysis : null;
+}
+
+/** Claude 요약 줄. 모델이 쓴 글자도 외부 글자로 보고 이스케이프한다. */
+function analysisLines(analysis: Analysis): string[] {
+  const lines = [`>${escapeSlack(analysis.summary)}`, `의심 계층 ${analysis.suspectedLayer} · 신뢰도 ${analysis.confidence}`];
+  if (analysis.userImpact) lines.push(`사용자 영향: ${escapeSlack(analysis.userImpact)}`);
+  if (analysis.nextChecks.length > 0) {
+    lines.push(`먼저 볼 것: ${analysis.nextChecks.map((check, index) => `${index + 1}) ${escapeSlack(check)}`).join(" ")}`);
+  }
+  return lines;
+}
+
+function frameLine(frame: MaskedFrame): string {
+  const line = frame.line === null ? "" : `:${frame.line}`;
+  const fn = frame.function ? ` (${escapeSlack(frame.function)})` : "";
+  return `위치 ${escapeSlack(frame.filename)}${line}${fn}`;
+}
+
+function correlatedLine(ids: readonly string[], sites: readonly Target[]): string | null {
+  // 설정에서 빠진 사이트는 이름을 모르므로 적지 않는다.
+  const names = ids.flatMap((id) => sites.find((site) => site.id === id)?.name ?? []);
+  if (names.length === 0) return null;
+  const pages = STATUS_PAGES.map(({ name, url }) => `<${url}|${name}>`).join(" · ");
+  return `같은 시각 다른 사이트도 에러: ${names.map(escapeSlack).join(", ")} · 플랫폼 문제일 수 있음 (${pages})`;
+}
+
 /**
  * 본문 줄. 버튼을 누른 뒤 다시 그릴 때(`withReason: false`)는 알림 이유를 뺀다.
  * 그때는 이미 보낸 incident라 '다시 알림'으로 잘못 바뀌고, 어느 알림의 버튼인지도 알 수 없다.
  */
-function details(incident: Incident, withReason: boolean): string[] {
+function details(incident: Incident, withReason: boolean, sites: readonly Target[]): string[] {
   const { evidence } = incident;
   const area = `영역 ${escapeSlack(incident.area)}`;
   const lines = [withReason ? `${reason(incident)} · ${area}` : area];
@@ -106,11 +168,16 @@ function details(incident: Incident, withReason: boolean): string[] {
   }
   lines.push(`처음 ${kst(incident.firstSeen)} · 마지막 ${kst(incident.lastSeen)} (KST)`);
   if (evidence.route) lines.push(`경로 ${escapeSlack(evidence.route)}`);
+  const extra = currentAnalysis(incident);
+  // 호출 지점(가장 안쪽 프레임)만 적는다. 나머지는 Sentry에서 본다.
+  if (extra && extra.frames.length > 0) lines.push(frameLine(extra.frames[0]));
   if (evidence.relatedDeploy) {
     const { sha, deploymentId, readyAt, createdAt } = evidence.relatedDeploy;
     const name = sha ? sha.slice(0, 7) : deploymentId;
     lines.push(`배포 직후: ${kst(readyAt ?? createdAt)}에 공개된 배포 ${escapeSlack(name)}`);
   }
+  const correlated = extra ? correlatedLine(extra.correlated, sites) : null;
+  if (correlated) lines.push(correlated);
   return lines;
 }
 
@@ -144,20 +211,41 @@ function stateLine(state: IncidentState): string {
   return `${stateSummary(state)}${by}`;
 }
 
+export type MessageOptions = {
+  ownerUserId?: string;
+  state?: IncidentState;
+  // 같은 시각 에러가 난 다른 사이트의 이름을 찾는 설정. 없으면 그 줄을 적지 않는다.
+  sites?: readonly Target[];
+  // Claude 요약을 만들지 못한 이유. 상세 알림을 처음 보낼 때만 적는다.
+  analysisFailure?: AnalysisFailure | null;
+};
+
 /**
  * incident 하나의 상세 메시지. P1이면 담당자를 멘션한다.
+ * 제목 → Claude 요약(있으면) → 규칙이 모은 근거 → 버튼. 등급·알림 여부는 규칙이 정하고 요약은 참고용이다.
  * `state`가 있으면 버튼 대신 처리 결과를 적는다(버튼을 누른 뒤 원래 메시지를 바꿀 때).
  */
 export function incidentMessage(
   target: Target,
   incident: Incident,
-  { ownerUserId, state }: { ownerUserId?: string; state?: IncidentState } = {},
+  { ownerUserId, state, sites = [], analysisFailure = null }: MessageOptions = {},
 ): SlackMessage {
   const call = !state && incident.severity === "P1" ? mention(ownerUserId) : "";
   const title = headline(target, incident);
-  const body = [`${call}*${title}*`, ...details(incident, !state)].join("\n");
+  const analysis = currentAnalysis(incident)?.result ?? null;
+  const body = [
+    `${call}*${title}*`,
+    ...(analysis ? analysisLines(analysis) : []),
+    ...details(incident, !state, sites),
+  ].join("\n");
 
   const blocks: SlackBlock[] = [{ type: "section", text: mrkdwn(clip(body, SECTION_LIMIT)) }];
+  const note = analysis
+    ? "요약: Claude · 참고용 (등급·알림은 규칙 기준)"
+    : analysisFailure
+      ? `요약 없음 · ${FAILURE_LABEL[analysisFailure]}`
+      : null;
+  if (!state && note) blocks.push({ type: "context", elements: [mrkdwn(note)] });
   blocks.push(
     state
       ? { type: "context", elements: [mrkdwn(stateLine(state))] }
@@ -214,6 +302,10 @@ export function planReport(pending: readonly Incident[]): {
 export type DeliveryResult = {
   // 보낸 상세 메시지 수
   detailed: number;
+  // 이번에 Claude가 새로 요약한 수(저장된 요약을 다시 쓴 건 빼고)
+  analyzed: number;
+  // 요약을 만들지 못한 이유. 알림은 템플릿으로 나갔다.
+  analysisFailures: AnalysisFailure[];
   // 묶음 메시지에 넣어 보낸 incident 수
   bundled: number;
   // 표를 받은 뒤 등급 상승·해결·음소거로 표가 무효가 돼 건너뛴 수
@@ -229,7 +321,88 @@ export type DeliveryOptions = {
   // 새 전송·재시도 대기를 시작하기 전에만 확인한다. `afterMs`는 그만큼 기다린 뒤에도 시간이 남는지 묻는다.
   // 보내는 중인 전송은 끊지 않는다(끊으면 Slack은 받았는데 다음 실행이 또 보낸다).
   shouldStop?: (afterMs?: number) => boolean;
+  // 상세 알림의 Claude 요약. 없으면 템플릿만 보낸다(webhook).
+  analyzer?: Analyzer;
+  // Sentry 최신 이벤트의 스택(파일·함수·줄). 실패하면 스택 없이 보낸다.
+  frames?: (incident: Incident) => Promise<MaskedFrame[]>;
+  // 설정된 모든 사이트. 같은 시각 에러가 난 다른 사이트의 이름을 적는다.
+  sites?: readonly Target[];
 };
+
+/** Claude에게 넘길 근거. 규칙이 이미 모은 값만 넣는다. */
+export function analysisInput(
+  target: Target,
+  incident: Incident,
+  frames: readonly MaskedFrame[],
+  otherSites: readonly string[],
+): AnalysisInput {
+  const { evidence } = incident;
+  const deploy = evidence.relatedDeploy;
+  return {
+    site: target.name,
+    severity: incident.severity,
+    area: incident.area,
+    kind: evidence.kind,
+    title: incident.title,
+    tag: evidence.tag,
+    route: evidence.route,
+    count: evidence.count,
+    users: evidence.users,
+    recentIncrease: evidence.source === "sentry" ? windowIncrease(evidence.snapshots) : 0,
+    episode: incident.episode,
+    firstSeen: incident.firstSeen,
+    lastSeen: incident.lastSeen,
+    frames,
+    relatedDeploy: deploy
+      ? { liveAt: deploy.readyAt ?? deploy.createdAt, sha: deploy.sha ? deploy.sha.slice(0, 7) : null }
+      : null,
+    otherSitesWithErrors: otherSites,
+  };
+}
+
+type Prepared = { analyzed: boolean; failure: AnalysisFailure | null };
+
+/**
+ * 상세 알림 하나의 보조 정보(스택·같은 시각 다른 사이트·Claude 요약)를 모아 저장한다.
+ * 이 회차·등급의 요약이 이미 있으면 Claude를 다시 부르지 않는다(전송 실패 뒤 다시 보낼 때).
+ * 배포 실패는 오류 문구가 없어 요약할 거리가 없으므로 부르지 않는다.
+ * 스택·Claude 실패는 알림을 막지 않는다. DB 오류만 던진다.
+ */
+async function prepareDetail(
+  db: Client,
+  target: Target,
+  incident: Incident,
+  claim: string,
+  now: Date,
+  { analyzer, frames: fetchFrames, sites = [], shouldStop }: DeliveryOptions & { shouldStop: (afterMs?: number) => boolean },
+): Promise<Prepared> {
+  const key = analysisKey(incident);
+  if (incident.analysis?.key === key && incident.analysis.result) return { analyzed: false, failure: null };
+
+  const [correlated, frames] = await Promise.all([
+    findCorrelatedTargets(db, incident),
+    incident.evidence.source === "sentry" && fetchFrames
+      ? fetchFrames(incident).catch((): MaskedFrame[] => [])
+      : Promise.resolve<MaskedFrame[]>([]),
+  ]);
+
+  let result: Analysis | null = null;
+  let model: string | null = null;
+  let failure: AnalysisFailure | null = null;
+  if (analyzer && incident.evidence.kind !== "deploy.failed") {
+    if (shouldStop(ANALYSIS_TIMEOUT_MS + ANALYSIS_SEND_RESERVE_MS)) {
+      failure = "no_time";
+    } else {
+      const names = correlated.flatMap((id) => sites.find((site) => site.id === id)?.name ?? []);
+      const outcome = await analyzer(analysisInput(target, incident, frames, names));
+      if (outcome.ok) ({ analysis: result, model } = outcome);
+      else failure = outcome.reason;
+    }
+  }
+
+  await saveAnalysis(db, incident.id, claim, { key, result, model, frames, correlated, at: now.toISOString() });
+  return { analyzed: result !== null, failure };
+}
 
 /** 전송 자체의 실패(Slack 오류 등). DB 오류와 구분해 전송 실패로만 남기려고 감싼다. */
 class SendFailed extends Error {
@@ -286,13 +459,22 @@ export async function deliverPending(
   target: Target,
   now: Date,
   send: Send,
-  { ownerUserId, sleep = wait, shouldStop = () => false }: DeliveryOptions = {},
+  options: DeliveryOptions = {},
 ): Promise<DeliveryResult> {
-  const result: DeliveryResult = { detailed: 0, bundled: 0, skipped: 0, error: null };
+  const { ownerUserId, sleep = wait, shouldStop = () => false, sites = [] } = options;
+  const result: DeliveryResult = {
+    detailed: 0,
+    analyzed: 0,
+    analysisFailures: [],
+    bundled: 0,
+    skipped: 0,
+    error: null,
+  };
   const { claim, incidents } = await claimPending(db, target.id, now);
   if (incidents.length === 0) return result;
 
   const { detailed, bundled } = planReport(incidents);
+  const failures = new Map<number, AnalysisFailure>();
   let sentBefore = false;
   // 모두 같은 채널로 간다. 이어 보낼 때 간격을 둔다.
   const paced = async (message: SlackMessage) => {
@@ -307,13 +489,32 @@ export async function deliverPending(
   };
 
   try {
+    // 상세 알림의 요약을 한꺼번에 만든다. Claude 호출을 하나씩 기다리면 첫 알림이 그만큼 늦는다.
+    // 하나가 DB 오류로 실패해도 나머지가 끝난 뒤 던진다(표를 돌려준 뒤에 쓰지 않게).
+    const prepared = await Promise.allSettled(
+      detailed.map((incident) => prepareDetail(db, target, incident, claim, now, { ...options, shouldStop })),
+    );
+    for (const [index, outcome] of prepared.entries()) {
+      if (outcome.status === "rejected") throw outcome.reason;
+      if (outcome.value.analyzed) result.analyzed++;
+      if (outcome.value.failure) {
+        result.analysisFailures.push(outcome.value.failure);
+        failures.set(detailed[index].id, outcome.value.failure);
+      }
+    }
+
     for (const planned of detailed) {
       const incident = await getClaimedIncident(db, planned.id, claim);
       if (!incident) {
         result.skipped++;
         continue;
       }
-      const { ts } = await paced(incidentMessage(target, incident, { ownerUserId }));
+      const message = incidentMessage(target, incident, {
+        ownerUserId,
+        sites,
+        analysisFailure: failures.get(incident.id) ?? null,
+      });
+      const { ts } = await paced(message);
       await completeNotification(db, incident.id, claim, ts, now);
       result.detailed++;
     }
@@ -381,7 +582,7 @@ export async function handleAction(
       return ephemeral("이미 해결된 incident입니다.");
     }
     const updated = (await getIncident(db, incident.id)) ?? incident;
-    return replace(incidentMessage(target, updated, { state: { kind: "resolved", at: now, by } }));
+    return replace(incidentMessage(target, updated, { state: { kind: "resolved", at: now, by }, sites: targets }));
   }
 
   const until = new Date(
@@ -389,5 +590,5 @@ export async function handleAction(
   );
   await muteIncident(db, target.id, incident.fingerprint, until, now);
   const updated = (await getIncident(db, incident.id)) ?? incident;
-  return replace(incidentMessage(target, updated, { state: { kind: "muted", until, by } }));
+  return replace(incidentMessage(target, updated, { state: { kind: "muted", until, by }, sites: targets }));
 }
