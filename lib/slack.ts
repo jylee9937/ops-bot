@@ -71,9 +71,19 @@ export class SlackError extends Error {
   constructor(
     readonly reason: SlackErrorReason,
     readonly code?: string,
+    // rate_limit일 때 Slack이 알려 준 대기 시간
+    readonly retryAfterMs?: number,
   ) {
     super(`Slack 전송 실패: ${reason}${code ? ` (${code})` : ""}`);
   }
+}
+
+/** `Retry-After`(초)를 밀리초로. 형식이 다르거나 1시간을 넘으면 버린다. */
+function retryAfterOf(response: Response): number | undefined {
+  const raw = response.headers.get("retry-after");
+  if (!raw || !/^[0-9]{1,4}$/.test(raw)) return undefined;
+  const seconds = Number(raw);
+  return seconds <= 3_600 ? seconds * 1_000 : undefined;
 }
 
 const AUTH_ERRORS = new Set([
@@ -124,7 +134,7 @@ export async function postMessage(
     throw new SlackError("network");
   }
 
-  if (response.status === 429) throw new SlackError("rate_limit");
+  if (response.status === 429) throw new SlackError("rate_limit", undefined, retryAfterOf(response));
   if (response.status >= 500) throw new SlackError("server", String(response.status));
   if (!response.ok) throw new SlackError("bad_request", String(response.status));
 
@@ -144,7 +154,9 @@ export async function postMessage(
   const code = error && ERROR_CODE.test(error) ? error : undefined;
   if (code && AUTH_ERRORS.has(code)) throw new SlackError("auth", code);
   if (code && CHANNEL_ERRORS.has(code)) throw new SlackError("channel", code);
-  if (code && RATE_LIMIT_ERRORS.has(code)) throw new SlackError("rate_limit", code);
+  if (code && RATE_LIMIT_ERRORS.has(code)) {
+    throw new SlackError("rate_limit", code, retryAfterOf(response));
+  }
   throw new SlackError("bad_request", code);
 }
 

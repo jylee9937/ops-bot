@@ -131,6 +131,26 @@ describe("postMessage", () => {
     });
   });
 
+  it("[리뷰 5] 429의 Retry-After를 밀리초로 남긴다", async () => {
+    const fake = fakeFetch([
+      new Response("", { status: 429, headers: { "retry-after": "3" } }),
+      jsonResponse({ ok: false, error: "ratelimited" }, { headers: { "retry-after": "2" } }),
+      new Response("", { status: 429, headers: { "retry-after": "soon" } }),
+    ]);
+    await expect(postMessage(MESSAGE, TOKEN, { fetchImpl: fake.impl })).rejects.toMatchObject({
+      reason: "rate_limit",
+      retryAfterMs: 3_000,
+    });
+    await expect(postMessage(MESSAGE, TOKEN, { fetchImpl: fake.impl })).rejects.toMatchObject({
+      reason: "rate_limit",
+      retryAfterMs: 2_000,
+    });
+    await expect(postMessage(MESSAGE, TOKEN, { fetchImpl: fake.impl })).rejects.toMatchObject({
+      reason: "rate_limit",
+      retryAfterMs: undefined,
+    });
+  });
+
   it("네트워크 오류와 시간 초과는 network 실패다", async () => {
     const fake = fakeFetch([new TypeError("fetch failed")]);
     await expect(postMessage(MESSAGE, TOKEN, { fetchImpl: fake.impl })).rejects.toMatchObject({

@@ -389,19 +389,24 @@ function planSignal(
   };
 }
 
-/** ops-bot 상태만 바꾼다. Sentry에는 쓰지 않는다. 바뀌었으면 true. */
+/**
+ * ops-bot 상태만 바꾼다. Sentry에는 쓰지 않는다. 바뀌었으면 true.
+ * `episode`를 주면 그 회차가 열려 있을 때만 닫는다. 확인한 뒤 다시 열린 새 회차를 닫지 않게 한다.
+ */
 export async function resolveIncident(
   db: Client,
   targetId: string,
   fingerprint: string,
   now: Date,
+  episode?: number,
 ): Promise<boolean> {
   const { rowsAffected } = await db.execute({
     sql: `UPDATE incidents
           SET status = 'resolved', resolved_at = ?, pending_since = NULL, ${CLEAR_CLAIM},
               version = version + 1
-          WHERE target = ? AND fingerprint = ? AND status = 'open'`,
-    args: [now.toISOString(), targetId, fingerprint],
+          WHERE target = ? AND fingerprint = ? AND status = 'open'
+            ${episode === undefined ? "" : "AND episode = ?"}`,
+    args: [now.toISOString(), targetId, fingerprint, ...(episode === undefined ? [] : [episode])],
   });
   return rowsAffected === 1;
 }
@@ -463,6 +468,88 @@ export async function listOpenSentryIncidents(
     args: [targetId, limit],
   });
   return rows.map(toIncident);
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { P1: 0, P2: 1, P3: 2 };
+
+/**
+ * 한 사이트의 미전송 incident 전부에 이 실행의 표를 한 번에 붙이고, 그 순간의 내용을 돌려준다.
+ * 표와 내용을 한 문장에서 얻으므로, 표가 무효가 된 뒤의 내용을 이 표로 보내는 일이 없다.
+ * 등급 높은 순(같으면 오래 기다린 순)으로 정렬한다.
+ */
+export async function claimPending(
+  db: Client,
+  targetId: string,
+  now: Date,
+): Promise<{ claim: string; incidents: Incident[] }> {
+  const claim = crypto.randomUUID();
+  const { rows } = await db.execute({
+    sql: `UPDATE incidents SET notify_claimed_at = ?, notify_claim = ?
+          WHERE target = ? AND status = 'open' AND notified_at IS NULL
+            AND (notify_claimed_at IS NULL OR notify_claimed_at <= ?)
+          RETURNING *`,
+    args: [now.toISOString(), claim, targetId, isoBefore(now, CLAIM_TTL_MS)],
+  });
+  const incidents = rows
+    .map(toIncident)
+    .sort(
+      (a, b) =>
+        SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
+        (a.pendingSince ?? "").localeCompare(b.pendingSince ?? "") ||
+        a.id - b.id,
+    );
+  return { claim, incidents };
+}
+
+/** 이 표가 아직 유효한 incident의 지금 내용. 등급 상승·해결·음소거로 표가 무효가 됐으면 null. */
+export async function getClaimedIncident(
+  db: Client,
+  id: number,
+  claim: string,
+): Promise<Incident | null> {
+  const { rows } = await db.execute({
+    sql: `SELECT * FROM incidents
+          WHERE id = ? AND notify_claim = ? AND status = 'open' AND notified_at IS NULL`,
+    args: [id, claim],
+  });
+  return rows[0] ? toIncident(rows[0]) : null;
+}
+
+/** 이 표가 아직 유효한 incident 전부. */
+export async function listClaimed(db: Client, claim: string): Promise<Incident[]> {
+  const { rows } = await db.execute({
+    sql: `SELECT * FROM incidents
+          WHERE notify_claim = ? AND status = 'open' AND notified_at IS NULL
+          ORDER BY severity, pending_since, id`,
+    args: [claim],
+  });
+  return rows.map(toIncident);
+}
+
+/** 여러 건을 한 번에 전달 완료로 기록한다(묶음 메시지). 표가 유효한 건만 반영하고 그 수를 돌려준다. */
+export async function completeNotifications(
+  db: Client,
+  ids: readonly number[],
+  claim: string,
+  slackTs: string | null,
+  now: Date,
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const { rowsAffected } = await db.execute({
+    sql: `UPDATE incidents
+          SET notified_at = ?, slack_ts = COALESCE(?, slack_ts), ${CLEAR_CLAIM}, pending_since = NULL
+          WHERE notify_claim = ? AND id IN (${ids.map(() => "?").join(", ")})`,
+    args: [now.toISOString(), slackTs, claim, ...ids],
+  });
+  return rowsAffected;
+}
+
+/** 이 표로 보내지 못한 incident를 모두 돌려준다. 다음 실행이 다시 보낸다. */
+export async function releaseClaim(db: Client, claim: string): Promise<void> {
+  await db.execute({
+    sql: `UPDATE incidents SET ${CLEAR_CLAIM} WHERE notify_claim = ?`,
+    args: [claim],
+  });
 }
 
 /**

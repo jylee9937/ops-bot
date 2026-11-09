@@ -7,6 +7,7 @@ import {
   ingest,
   listPending,
   recordDeploys,
+  resolveIncident,
   type Incident,
 } from "./incidents";
 import { maskLogMessage, tagOf } from "./mask";
@@ -21,12 +22,13 @@ import {
   type Send,
 } from "./report";
 import type { Signal } from "./signal";
-import type { Interaction, SlackBlock, SlackMessage, SlackResponse } from "./slack";
+import { SlackError, type Interaction, type SlackBlock, type SlackMessage, type SlackResponse } from "./slack";
 import type { Target } from "./targets";
 
 const at = (time: string) => new Date(`2026-11-07T${time}:00.000Z`);
 const iso = (time: string) => at(time).toISOString();
 const OWNER = "U0OWNER1";
+const NO_WAIT = { sleep: async () => {} };
 
 const TARGET: Target = {
   id: "site-a",
@@ -322,7 +324,7 @@ describe("report", () => {
       await ingest(db, TARGET, Array.from({ length: 6 }, (_, i) => issue(i + 1, i === 5 ? "auth" : "articles")), at("01:00"));
       const { sent, send } = recorder();
 
-      const result = await deliverPending(db, TARGET, at("01:01"), send, { ownerUserId: OWNER });
+      const result = await deliverPending(db, TARGET, at("01:01"), send, { ownerUserId: OWNER, ...NO_WAIT });
 
       expect(result).toEqual({ detailed: 5, bundled: 1, skipped: 0, error: null });
       expect(sent).toHaveLength(6);
@@ -337,15 +339,15 @@ describe("report", () => {
     it("5건 이하면 묶음 없이 보낸다", async () => {
       await ingest(db, TARGET, [issue(1), issue(2), issue(3)], at("01:00"));
       const { sent, send } = recorder();
-      expect(await deliverPending(db, TARGET, at("01:01"), send)).toMatchObject({ detailed: 3, bundled: 0 });
+      expect(await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT)).toMatchObject({ detailed: 3, bundled: 0 });
       expect(sent).toHaveLength(3);
     });
 
     it("같은 실행을 두 번 해도 한 번만 보낸다", async () => {
       await ingest(db, TARGET, [issue(1)], at("01:00"));
       const { sent, send } = recorder();
-      await deliverPending(db, TARGET, at("01:01"), send);
-      await deliverPending(db, TARGET, at("01:02"), send);
+      await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT);
+      await deliverPending(db, TARGET, at("01:02"), send, NO_WAIT);
       expect(sent).toHaveLength(1);
     });
 
@@ -353,14 +355,14 @@ describe("report", () => {
       await ingest(db, TARGET, Array.from({ length: 7 }, (_, i) => issue(i + 1)), at("01:00"));
       const down = recorder((index) => index === 1);
 
-      const first = await deliverPending(db, TARGET, at("01:01"), down.send);
+      const first = await deliverPending(db, TARGET, at("01:01"), down.send, NO_WAIT);
       expect(first).toMatchObject({ detailed: 1, bundled: 0 });
       expect(first.error).toBeInstanceOf(Error);
       // 실패한 건부터 바로 다시 보낼 수 있다(표를 돌려줌)
       expect((await listPending(db, TARGET.id, at("01:01"))).length).toBe(6);
 
       const up = recorder();
-      expect(await deliverPending(db, TARGET, at("01:02"), up.send)).toMatchObject({
+      expect(await deliverPending(db, TARGET, at("01:02"), up.send, NO_WAIT)).toMatchObject({
         detailed: 5,
         bundled: 1,
         error: null,
@@ -372,38 +374,17 @@ describe("report", () => {
       await ingest(db, TARGET, Array.from({ length: 6 }, (_, i) => issue(i + 1)), at("01:00"));
       const { send } = recorder((index) => index === 5);
 
-      const result = await deliverPending(db, TARGET, at("01:01"), send);
+      const result = await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT);
       expect(result).toMatchObject({ detailed: 5, bundled: 0 });
       expect((await listPending(db, TARGET.id, at("01:01"))).map((i) => i.fingerprint)).toEqual(["sentry:6"]);
     });
 
-    it("다른 실행이 보내는 중인 incident는 건너뛴다", async () => {
+    it("다른 실행이 보내는 중인 incident는 건드리지 않는다", async () => {
       await ingest(db, TARGET, [issue(1), issue(2)], at("01:00"));
-      const other = await byFingerprint("sentry:1");
-      const plan = await listPending(db, TARGET.id, at("01:01"));
-      // 목록을 읽은 뒤 다른 실행이 표를 가져갔다
-      const raced = new Proxy(db, {
-        get(target, property) {
-          if (property === "execute") {
-            let first = true;
-            return async (...args: Parameters<Client["execute"]>) => {
-              if (first) {
-                first = false;
-                const result = await target.execute(...args);
-                await claimNotification(target, other.id, at("01:01"));
-                return result;
-              }
-              return target.execute(...args);
-            };
-          }
-          const value = Reflect.get(target, property, target);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-      });
-      expect(plan).toHaveLength(2);
+      await claimNotification(db, (await byFingerprint("sentry:1")).id, at("01:01"));
 
       const { sent, send } = recorder();
-      expect(await deliverPending(raced, TARGET, at("01:01"), send)).toMatchObject({ detailed: 1, skipped: 1 });
+      expect(await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT)).toMatchObject({ detailed: 1 });
       expect(sent.map((m) => m.text)).toEqual(["[P2][사이트 A] [articles] 조회 실패 2 ×1 (10분)"]);
     });
 
@@ -429,7 +410,7 @@ describe("report", () => {
       });
 
       const { sent, send } = recorder();
-      await deliverPending(raced, TARGET, at("01:01"), send);
+      await deliverPending(raced, TARGET, at("01:01"), send, NO_WAIT);
       expect(escalated).toBe(true);
       expect(sent.map((m) => m.text)).toEqual(["[P1][사이트 A] [articles] 조회 실패 1 ×5 (10분)"]);
     });
@@ -445,13 +426,105 @@ describe("report", () => {
         return { ts: `1.${sent.length}` };
       };
 
-      await deliverPending(db, TARGET, at("01:01"), send);
+      await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT);
       expect((await listPending(db, TARGET.id, at("01:01"))).map((i) => i.severity)).toEqual(["P1"]);
-      await deliverPending(db, TARGET, at("01:02"), send);
+      await deliverPending(db, TARGET, at("01:02"), send, NO_WAIT);
       expect(sent).toEqual([
         "[P2][사이트 A] [articles] 조회 실패 1 ×1 (10분)",
         "[P1][사이트 A] [articles] 조회 실패 1 ×5 (10분)",
       ]);
+    });
+
+    it("[리뷰 2] 표를 받은 뒤 다른 실행이 오른 등급을 이미 보냈으면 다시 보내지 않는다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const other = recorder();
+      let raced = false;
+      const runA = new Proxy(db, {
+        get(target, property) {
+          if (property === "execute") {
+            return async (...args: Parameters<Client["execute"]>) => {
+              const [statement] = args as unknown as [string | { sql: string }];
+              const sql = typeof statement === "string" ? statement : statement.sql;
+              const result = await target.execute(...args);
+              if (!raced && sql.includes("SET notify_claimed_at = ?, notify_claim = ?")) {
+                raced = true;
+                // A가 표를 받은 직후: 등급이 올라 표가 무효가 되고, B가 P1을 보낸다
+                await ingest(target, TARGET, [issue(1, "articles", { count: 5, lastSeen: iso("01:01") })], at("01:01"));
+                await deliverPending(target, TARGET, at("01:01"), other.send, { ownerUserId: OWNER, ...NO_WAIT });
+              }
+              return result;
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      const mine = recorder();
+      await deliverPending(runA, TARGET, at("01:01"), mine.send, { ownerUserId: OWNER, ...NO_WAIT });
+      expect(raced).toBe(true);
+      expect(other.sent.map((m) => m.text)).toEqual([`<@${OWNER}> [P1][사이트 A] [articles] 조회 실패 1 ×5 (10분)`]);
+      expect(mine.sent).toEqual([]);
+    });
+
+    it("[리뷰 3] 계획 뒤 P1로 오른 incident는 묶음에 넣지 않고 다음 실행에 상세로 보낸다", async () => {
+      await ingest(db, TARGET, Array.from({ length: 6 }, (_, i) => issue(i + 1)), at("01:00"));
+      const sent: SlackMessage[] = [];
+      const send: Send = async (message) => {
+        sent.push(message);
+        if (sent.length === 5) {
+          await ingest(db, TARGET, [issue(6, "articles", { count: 5, lastSeen: iso("01:01") })], at("01:01"));
+        }
+        return { ts: `1.${sent.length}` };
+      };
+
+      const first = await deliverPending(db, TARGET, at("01:01"), send, { ownerUserId: OWNER, ...NO_WAIT });
+      expect(first).toMatchObject({ detailed: 5, bundled: 0 });
+      expect(sent).toHaveLength(5);
+      expect((await listPending(db, TARGET.id, at("01:01"))).map((i) => i.severity)).toEqual(["P1"]);
+
+      await deliverPending(db, TARGET, at("01:02"), send, { ownerUserId: OWNER, ...NO_WAIT });
+      expect(sent[5].text).toBe(`<@${OWNER}> [P1][사이트 A] [articles] 조회 실패 6 ×5 (10분)`);
+      expect(sent[5].blocks.some((b) => b.type === "actions")).toBe(true);
+    });
+
+    it("[리뷰 5] Slack이 Retry-After를 주면 기다렸다가 한 번 다시 보낸다", async () => {
+      await ingest(db, TARGET, Array.from({ length: 6 }, (_, i) => issue(i + 1)), at("01:00"));
+      const waits: number[] = [];
+      const sent: string[] = [];
+      let limited = false;
+      const send: Send = async (message) => {
+        if (sent.length === 1 && !limited) {
+          limited = true;
+          throw new SlackError("rate_limit", "ratelimited", 1_000);
+        }
+        sent.push(message.text);
+        return { ts: `1.${sent.length}` };
+      };
+
+      const result = await deliverPending(db, TARGET, at("01:01"), send, {
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+      });
+      expect(result).toMatchObject({ detailed: 5, bundled: 1, error: null });
+      expect(sent).toHaveLength(6);
+      expect(waits).toContain(1_000);
+      // 같은 채널에는 1초가 넘는 간격을 두고 보낸다
+      expect(waits.filter((ms) => ms >= 1_000 && ms !== 1_000)).toHaveLength(5);
+    });
+
+    it("[리뷰 5] 기다릴 시간이 너무 길면 멈추고 다음 실행에 맡긴다", async () => {
+      await ingest(db, TARGET, [issue(1), issue(2)], at("01:00"));
+      let calls = 0;
+      const send: Send = async () => {
+        calls++;
+        throw new SlackError("rate_limit", "ratelimited", 60_000);
+      };
+      const result = await deliverPending(db, TARGET, at("01:01"), send, NO_WAIT);
+      expect(result.error).toBeInstanceOf(SlackError);
+      expect(calls).toBe(1);
+      expect(await listPending(db, TARGET.id, at("01:01"))).toHaveLength(2);
     });
   });
 
@@ -460,6 +533,49 @@ describe("report", () => {
       if (!("blocks" in response)) throw new Error(`원래 메시지를 바꾸지 않았습니다: ${response.text}`);
       return response;
     };
+
+    it("[리뷰 1] 확인한 뒤 다른 실행이 다시 열었으면 새 회차를 닫지 않는다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const incident = await byFingerprint("sentry:1");
+      let raced = false;
+      const racedDb = new Proxy(db, {
+        get(target, property) {
+          if (property === "execute") {
+            return async (...args: Parameters<Client["execute"]>) => {
+              const [statement] = args as unknown as [string | { sql: string }];
+              const sql = typeof statement === "string" ? statement : statement.sql;
+              if (!raced && sql.includes("SET status = 'resolved'")) {
+                raced = true;
+                // 버튼 요청이 회차를 확인한 뒤: Sentry 해결 → 재발로 2회차가 열린다
+                await resolveIncident(target, TARGET.id, "sentry:1", at("01:05"));
+                await ingest(target, TARGET, [issue(1, "articles", { kind: "issue.regressed", count: 2, lastSeen: iso("01:06") })], at("01:06"));
+              }
+              return target.execute(...args);
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      const response = await handleAction(racedDb, [TARGET], interaction(incident), at("01:07"));
+      expect(raced).toBe(true);
+      expect(response).toMatchObject({ response_type: "ephemeral" });
+      expect(response.text).toContain("지금은 2회차");
+      const latest = await byFingerprint("sentry:1");
+      expect(latest).toMatchObject({ episode: 2, status: "open" });
+      expect(latest.pendingSince).not.toBeNull();
+    });
+
+    it("[리뷰 4] 메시지를 바꿀 때 대체 문구에는 외부 글자를 넣지 않는다", async () => {
+      const title = maskLogMessage("[articles] evil.example 로그인 확인");
+      await ingest(db, TARGET, [issue(1, "articles", { title, tag: tagOf(title) })], at("01:00"));
+      const incident = await byFingerprint("sentry:1");
+
+      const response = replaced(await handleAction(db, [TARGET], interaction(incident), at("02:00")));
+      expect(response.text).not.toContain("evil.example");
+      expect(response.text).toBe("[P2][사이트 A] 해결 처리 · 11/07 11:00");
+    });
 
     it("해결하면 상태를 바꾸고 버튼 없는 메시지로 바꾼다", async () => {
       await ingest(db, TARGET, [issue(1)], at("01:00"));

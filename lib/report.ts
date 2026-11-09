@@ -1,11 +1,13 @@
 import type { Client } from "@libsql/client";
 import {
-  claimNotification,
+  claimPending,
   completeNotification,
+  completeNotifications,
+  getClaimedIncident,
   getIncident,
-  listPending,
+  listClaimed,
   muteIncident,
-  releaseNotification,
+  releaseClaim,
   resolveIncident,
   type Incident,
 } from "./incidents";
@@ -16,6 +18,7 @@ import {
   LINK_ACTION_ID,
   mrkdwn,
   plainText,
+  SlackError,
   type ButtonElement,
   type Interaction,
   type SlackBlock,
@@ -31,6 +34,10 @@ export const BUNDLE_LINE_LIMIT = 20;
 export const MUTE_SHORT_MS = 60 * 60_000;
 // 끝없는 음소거는 재발을 영영 숨긴다. 끝난 뒤 새로 발생하면 다시 알린다.
 export const MUTE_LONG_MS = 30 * 24 * 60 * 60_000;
+/** 같은 채널에 이어 보낼 때 두는 간격. Slack은 채널당 초당 1건 정도를 허용한다. */
+export const SEND_INTERVAL_MS = 1_100;
+/** Slack이 알려 준 대기 시간이 이보다 길면 기다리지 않고 다음 실행에 맡긴다. */
+export const MAX_RETRY_WAIT_MS = 10_000;
 
 const SECTION_LIMIT = 3_000;
 const MAX_LINK_LENGTH = 1_000;
@@ -123,11 +130,13 @@ function buttons(incident: Incident): ButtonElement[] {
   ];
 }
 
+function stateSummary(state: IncidentState): string {
+  return state.kind === "resolved" ? `해결 처리 · ${kst(state.at)}` : `${kst(state.until)}까지 음소거`;
+}
+
 function stateLine(state: IncidentState): string {
   const by = isSlackUserId(state.by) ? ` · <@${state.by}>` : "";
-  return state.kind === "resolved"
-    ? `해결 처리 · ${kst(state.at)}${by}`
-    : `${kst(state.until)}까지 음소거${by}`;
+  return `${stateSummary(state)}${by}`;
 }
 
 /**
@@ -149,7 +158,11 @@ export function incidentMessage(
       ? { type: "context", elements: [mrkdwn(stateLine(state))] }
       : { type: "actions", elements: buttons(incident) },
   );
-  return { channel: target.slackChannel, text: clip(`${call}${title}`, SECTION_LIMIT), blocks };
+  // 버튼 응답으로 바꾸는 메시지는 parse 옵션을 줄 수 없다. 대체 문구에 외부 글자를 넣지 않는다.
+  const text = state
+    ? `[${incident.severity}][${escapeSlack(target.name)}] ${stateSummary(state)}`
+    : `${call}${title}`;
+  return { channel: target.slackChannel, text: clip(text, SECTION_LIMIT), blocks };
 }
 
 function linkLine(incident: Incident): string {
@@ -198,82 +211,101 @@ export type DeliveryResult = {
   detailed: number;
   // 묶음 메시지에 넣어 보낸 incident 수
   bundled: number;
-  // 다른 실행이 보내는 중이라 건너뛴 수
+  // 표를 받은 뒤 등급 상승·해결·음소거로 표가 무효가 돼 건너뛴 수
   skipped: number;
-  // 전송이 실패하면 남은 전송을 멈춘다. 표는 돌려줘 다음 실행이 다시 보낸다.
+  // 전송이나 기록이 실패하면 남은 전송을 멈춘다. 표는 돌려줘 다음 실행이 다시 보낸다.
   error: unknown;
 };
 
-type Claimed = { incident: Incident; claim: string };
+export type DeliveryOptions = {
+  ownerUserId?: string;
+  // 테스트에서 실제로 기다리지 않게 바꾼다.
+  sleep?: (ms: number) => Promise<void>;
+};
 
-/** 전송 표를 받은 뒤 다시 읽는다. 목록을 읽은 뒤 등급이 올랐으면 오른 내용을 보낸다. */
-async function claimFresh(db: Client, id: number, now: Date): Promise<Claimed | null> {
-  const claim = await claimNotification(db, id, now);
-  if (!claim) return null;
-  const incident = await getIncident(db, id);
-  if (!incident) {
-    await releaseNotification(db, id, claim);
-    return null;
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** rate limit이면 Slack이 알려 준 만큼 기다렸다가 한 번만 다시 보낸다. */
+async function sendWithRetry(
+  send: Send,
+  message: SlackMessage,
+  sleep: (ms: number) => Promise<void>,
+): Promise<{ ts: string }> {
+  try {
+    return await send(message);
+  } catch (error) {
+    const retryAfter = error instanceof SlackError ? error.retryAfterMs : undefined;
+    if (
+      error instanceof SlackError &&
+      error.reason === "rate_limit" &&
+      retryAfter !== undefined &&
+      retryAfter <= MAX_RETRY_WAIT_MS
+    ) {
+      await sleep(retryAfter);
+      return send(message);
+    }
+    throw error;
   }
-  return { incident, claim };
 }
 
 /**
  * 한 사이트의 미전송 incident를 보낸다. 상세 5건 + 나머지 묶음 1건.
- * 전송 중 등급이 오르면 완료 기록이 거부되고, 그 incident는 다음 실행에서 다시 나간다.
+ * 미전송 전부에 이 실행의 표를 한 번에 붙이고 그 순간의 내용으로 상세·묶음을 나눈다.
+ * 보내기 직전에 표가 아직 유효한지 확인한다. 그사이 등급이 오르거나 해결·음소거되면 건너뛰고,
+ * 오른 incident는 다음 실행에서 상세로 나간다. 보내지 못한 건은 끝에서 표를 돌려준다.
  */
 export async function deliverPending(
   db: Client,
   target: Target,
   now: Date,
   send: Send,
-  { ownerUserId }: { ownerUserId?: string } = {},
+  { ownerUserId, sleep = wait }: DeliveryOptions = {},
 ): Promise<DeliveryResult> {
   const result: DeliveryResult = { detailed: 0, bundled: 0, skipped: 0, error: null };
-  const { detailed, bundled } = planReport(await listPending(db, target.id, now));
+  const { claim, incidents } = await claimPending(db, target.id, now);
+  if (incidents.length === 0) return result;
 
-  for (const { id } of detailed) {
-    const claimed = await claimFresh(db, id, now);
-    if (!claimed) {
-      result.skipped++;
-      continue;
-    }
-    let ts: string;
-    try {
-      ({ ts } = await send(incidentMessage(target, claimed.incident, { ownerUserId })));
-    } catch (error) {
-      await releaseNotification(db, id, claimed.claim);
-      return { ...result, error };
-    }
-    await completeNotification(db, id, claimed.claim, ts, now);
-    result.detailed++;
-  }
+  const { detailed, bundled } = planReport(incidents);
+  let sentBefore = false;
+  // 모두 같은 채널로 간다. 이어 보낼 때 간격을 둔다.
+  const paced = async (message: SlackMessage) => {
+    if (sentBefore) await sleep(SEND_INTERVAL_MS);
+    sentBefore = true;
+    return sendWithRetry(send, message, sleep);
+  };
 
-  const claimedBundle: Claimed[] = [];
-  for (const { id } of bundled) {
-    const claimed = await claimFresh(db, id, now);
-    if (claimed) claimedBundle.push(claimed);
-    else result.skipped++;
-  }
-  if (claimedBundle.length === 0) return result;
-
-  // 다시 읽은 뒤 등급이 바뀌었을 수 있어 묶음 안에서도 P1을 먼저 적는다.
-  const incidents = claimedBundle
-    .map(({ incident }) => incident)
-    .sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
-  let ts: string;
   try {
-    ({ ts } = await send(bundleMessage(target, incidents)));
-  } catch (error) {
-    for (const { incident, claim } of claimedBundle) {
-      await releaseNotification(db, incident.id, claim);
+    for (const planned of detailed) {
+      const incident = await getClaimedIncident(db, planned.id, claim);
+      if (!incident) {
+        result.skipped++;
+        continue;
+      }
+      const { ts } = await paced(incidentMessage(target, incident, { ownerUserId }));
+      await completeNotification(db, incident.id, claim, ts, now);
+      result.detailed++;
     }
-    return { ...result, error };
+
+    if (bundled.length > 0) {
+      const ids = new Set(bundled.map(({ id }) => id));
+      const still = (await listClaimed(db, claim)).filter(({ id }) => ids.has(id));
+      result.skipped += ids.size - still.length;
+      if (still.length > 0) {
+        const { ts } = await paced(bundleMessage(target, still));
+        result.bundled = await completeNotifications(
+          db,
+          still.map(({ id }) => id),
+          claim,
+          ts,
+          now,
+        );
+      }
+    }
+  } catch (error) {
+    result.error = error;
+  } finally {
+    await releaseClaim(db, claim);
   }
-  for (const { incident, claim } of claimedBundle) {
-    await completeNotification(db, incident.id, claim, ts, now);
-  }
-  result.bundled = claimedBundle.length;
   return result;
 }
 
@@ -302,12 +334,14 @@ export async function handleAction(
 
   const by = interaction.userId;
   if (interaction.action === "resolve") {
-    if (incident.episode !== interaction.episode) {
-      return ephemeral(
-        `이 메시지는 ${interaction.episode}회차 알림입니다. 지금은 ${incident.episode}회차이니 새 알림의 버튼을 눌러 주세요.`,
-      );
-    }
-    if (!(await resolveIncident(db, target.id, incident.fingerprint, now))) {
+    // 회차 확인은 해결 UPDATE의 조건으로 한다. 따로 확인하면 그 사이에 다시 열릴 수 있다.
+    if (!(await resolveIncident(db, target.id, incident.fingerprint, now, interaction.episode))) {
+      const latest = await getIncident(db, incident.id);
+      if (latest && latest.episode !== interaction.episode) {
+        return ephemeral(
+          `이 메시지는 ${interaction.episode}회차 알림입니다. 지금은 ${latest.episode}회차이니 새 알림의 버튼을 눌러 주세요.`,
+        );
+      }
       return ephemeral("이미 해결된 incident입니다.");
     }
     const updated = (await getIncident(db, incident.id)) ?? incident;

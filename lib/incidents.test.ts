@@ -7,17 +7,22 @@ import { createDb, migrate } from "./db";
 import {
   acquireLock,
   claimNotification,
+  claimPending,
   completeNotification,
+  completeNotifications,
+  getClaimedIncident,
   findCorrelatedTargets,
   getCursor,
   getIncident,
   ingest,
   isDeliveryOverdue,
   listOpenSentryIncidents,
+  listClaimed,
   listPending,
   muteIncident,
   purgeExpired,
   recordDeploys,
+  releaseClaim,
   releaseLock,
   releaseNotification,
   resolveIncident,
@@ -780,6 +785,72 @@ describe("incidents", () => {
 
     it("빈 목록을 받아도 실패하지 않는다", async () => {
       await expect(recordDeploys(db, [], at("01:00"))).resolves.toBeUndefined();
+    });
+  });
+
+  describe("실행 단위 전송 표", () => {
+    const signals = () => [
+      issue({ fingerprint: "sentry:1", sourceId: "1" }),
+      issue({
+        fingerprint: "sentry:2",
+        sourceId: "2",
+        title: maskLogMessage("[auth] 로그인 실패"),
+        tag: tagOf(maskLogMessage("[auth] 로그인 실패")),
+      }),
+      issue({ fingerprint: "sentry:3", sourceId: "3" }),
+    ];
+
+    it("미전송 전부에 표를 붙이고 등급 높은 순으로 돌려준다", async () => {
+      await ingest(db, TARGET, signals(), at("01:00"));
+      const { claim, incidents } = await claimPending(db, TARGET.id, at("01:00"));
+
+      expect(incidents.map((i) => i.fingerprint)).toEqual(["sentry:2", "sentry:1", "sentry:3"]);
+      expect((await listClaimed(db, claim)).map((i) => i.fingerprint)).toEqual(["sentry:2", "sentry:1", "sentry:3"]);
+      // 다른 실행은 같은 incident를 받지 못한다
+      expect((await claimPending(db, TARGET.id, at("01:01"))).incidents).toEqual([]);
+      expect(await claimNotification(db, incidents[0].id, at("01:01"))).toBeNull();
+    });
+
+    it("다른 실행이 보내는 중인 incident와 다른 사이트는 받지 않는다", async () => {
+      await ingest(db, TARGET, signals(), at("01:00"));
+      await ingest(db, OTHER, [issue({ target: "site-b" })], at("01:00"));
+      await claimNotification(db, (await row("sentry:1")).id, at("01:00"));
+
+      const { incidents } = await claimPending(db, TARGET.id, at("01:00"));
+      expect(incidents.map((i) => i.fingerprint)).toEqual(["sentry:2", "sentry:3"]);
+    });
+
+    it("등급이 오르면 그 incident의 표만 무효가 된다", async () => {
+      await ingest(db, TARGET, signals(), at("01:00"));
+      const { claim, incidents } = await claimPending(db, TARGET.id, at("01:00"));
+      await ingest(db, TARGET, [issue({ count: 5, lastSeen: iso("01:01") })], at("01:01"));
+
+      const sentry1 = incidents.find((i) => i.fingerprint === "sentry:1");
+      expect(await getClaimedIncident(db, sentry1!.id, claim)).toBeNull();
+      expect((await listClaimed(db, claim)).map((i) => i.fingerprint)).toEqual(["sentry:2", "sentry:3"]);
+    });
+
+    it("묶음 완료는 표가 유효한 건만 기록하고, 남은 표는 한 번에 돌려준다", async () => {
+      await ingest(db, TARGET, signals(), at("01:00"));
+      const { claim, incidents } = await claimPending(db, TARGET.id, at("01:00"));
+      const [first, second, third] = incidents;
+      await muteIncident(db, TARGET.id, third.fingerprint, at("02:00"), at("01:00"));
+
+      expect(await completeNotifications(db, [second.id, third.id], claim, "9.9", at("01:01"))).toBe(1);
+      expect((await row(second.fingerprint)).slackTs).toBe("9.9");
+      expect(await completeNotifications(db, [], claim, "9.9", at("01:01"))).toBe(0);
+
+      await releaseClaim(db, claim);
+      expect(await getClaimedIncident(db, first.id, claim)).toBeNull();
+      expect((await listPending(db, TARGET.id, at("01:01"))).map((i) => i.fingerprint)).toEqual([first.fingerprint]);
+    });
+
+    it("회차를 주면 그 회차가 열려 있을 때만 해결한다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      expect(await resolveIncident(db, TARGET.id, "sentry:1", at("01:01"), 2)).toBe(false);
+      expect((await row()).status).toBe("open");
+      expect(await resolveIncident(db, TARGET.id, "sentry:1", at("01:01"), 1)).toBe(true);
+      expect((await row()).status).toBe("resolved");
     });
   });
 
