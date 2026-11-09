@@ -1,5 +1,5 @@
 import type { Client, InStatement, Row } from "@libsql/client";
-import { createDb } from "./db";
+import { createDb, migrate } from "./db";
 import { maskedFromStore, type MaskedText } from "./mask";
 import {
   baselineSnapshots,
@@ -31,6 +31,11 @@ const CLEAR_CLAIM = "notify_claimed_at = NULL, notify_claim = NULL";
 /** route가 쓰는 연결. 표는 계속 이 파일의 함수로만 읽고 쓴다. */
 export function openDb(): Client {
   return createDb();
+}
+
+/** 빠진 마이그레이션만 적용한다. collect가 실행마다 처음에 부른다(적용된 버전은 건너뜀). */
+export async function prepareDb(db: Client): Promise<void> {
+  await migrate(db);
 }
 
 export type RelatedDeploy = {

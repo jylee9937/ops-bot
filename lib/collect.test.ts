@@ -1,0 +1,337 @@
+import type { Client } from "@libsql/client";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createTestDb } from "./__fixtures__/test-db";
+import { reasonOf, rotate, runCollect, STATUS_CHECK_LIMIT, type CollectDeps } from "./collect";
+import { acquireLock, getCursor, listPending } from "./incidents";
+import { SlackError } from "./slack";
+import { SourceError } from "./sources/shared";
+import type { Target } from "./targets";
+
+const at = (time: string) => new Date(`2026-11-09T${time}:00.000Z`);
+const HEARTBEAT = "https://hc-ping.example/check-1";
+
+const TARGET: Target = {
+  id: "site-a",
+  name: "사이트 A",
+  vercel: { projectId: "prj_a", productionBranch: "main" },
+  sentry: { project: "site-a-prod", environment: "production" },
+  slackChannel: "#ops-a",
+  areas: [{ name: "공개 조회", severity: "P2", match: ["articles"] }],
+};
+const NO_SENTRY: Target = { ...TARGET, id: "site-b", name: "사이트 B", sentry: undefined, slackChannel: "#ops-b" };
+
+function sentryIssue(id: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    title: `Error: [articles] 목록 조회 실패 ${id}`,
+    culprit: "/articles",
+    count: "1",
+    userCount: 0,
+    firstSeen: "2026-11-09T00:58:00Z",
+    lastSeen: "2026-11-09T00:58:00Z",
+    permalink: `https://sentry.io/issues/${id}/`,
+    status: "unresolved",
+    substatus: "new",
+    issueCategory: "error",
+    metadata: { type: "Error", value: `[articles] 목록 조회 실패 ${id}` },
+    ...overrides,
+  };
+}
+
+function deployment(id: string, state: string) {
+  return {
+    uid: id,
+    created: at("00:50").getTime(),
+    ready: at("00:55").getTime(),
+    readyState: state,
+    target: "production",
+    errorCode: state === "ERROR" ? "BUILD_FAILED" : null,
+    inspectorUrl: `https://vercel.com/team/project/${id}`,
+    meta: { githubCommitSha: "abcdef0" },
+  };
+}
+
+/** 주소로 Sentry·Vercel·Slack·heartbeat를 구분해 응답하는 가짜 세상. */
+function world() {
+  const state = {
+    sentryIssues: [] as unknown[],
+    sentryStatus: {} as Record<string, string | number>,
+    deployments: [] as unknown[],
+    fail: {} as { sentry?: number; vercel?: number; slack?: string; heartbeat?: number },
+  };
+  const calls: string[] = [];
+  const slack: { channel: string; text: string; body: string }[] = [];
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+
+  const impl: typeof fetch = async (input, init) => {
+    if (init?.signal?.aborted) throw init.signal.reason;
+    const url = new URL(String(input));
+    if (url.href === HEARTBEAT) {
+      calls.push("heartbeat");
+      return new Response("OK", { status: state.fail.heartbeat ?? 200 });
+    }
+    if (url.hostname === "sentry.io") {
+      if (url.pathname.endsWith("/issues/")) {
+        calls.push("sentry:list");
+        return state.fail.sentry ? json({}, state.fail.sentry) : json(state.sentryIssues);
+      }
+      const id = /\/issues\/([^/]+)\/$/.exec(url.pathname)?.[1] ?? "";
+      calls.push(`sentry:status:${id}`);
+      const status = state.sentryStatus[id] ?? "unresolved";
+      return typeof status === "number" ? json({}, status) : json({ id, status });
+    }
+    if (url.hostname === "api.vercel.com") {
+      calls.push("vercel");
+      return state.fail.vercel ? json({}, state.fail.vercel) : json({ deployments: state.deployments, pagination: { next: null } });
+    }
+    if (url.hostname === "slack.com") {
+      calls.push("slack");
+      if (state.fail.slack) return json({ ok: false, error: state.fail.slack });
+      const body = JSON.parse(String(init?.body));
+      slack.push({ channel: body.channel, text: body.text, body: JSON.stringify(body.blocks) });
+      return json({ ok: true, ts: `1700000000.${String(slack.length).padStart(6, "0")}` });
+    }
+    throw new Error(`예상하지 못한 요청: ${url.hostname}`);
+  };
+  return { state, calls, slack, impl };
+}
+
+describe("runCollect", () => {
+  let db: Client;
+  let cleanup: () => void;
+  let w: ReturnType<typeof world>;
+
+  beforeEach(async () => {
+    ({ db, cleanup } = await createTestDb());
+    w = world();
+  });
+  afterEach(() => cleanup());
+
+  const deps = (time: string, overrides: Partial<CollectDeps> = {}): CollectDeps => ({
+    db,
+    targets: [TARGET],
+    sentry: { org: "example-org", token: "sentry-test-token" },
+    vercel: { teamId: "team_test", token: "vercel-test-token" },
+    slack: { token: "xoxb-test-token", ownerUserId: "U0OWNER1" },
+    heartbeatUrl: HEARTBEAT,
+    fetchImpl: w.impl,
+    sleep: async () => {},
+    now: () => at(time),
+    ...overrides,
+  });
+
+  it("배포 실패와 Sentry issue를 incident로 만들어 Slack으로 보내고 heartbeat를 보낸다", async () => {
+    w.state.deployments = [deployment("dpl_1", "ERROR"), deployment("dpl_0", "READY")];
+    w.state.sentryIssues = [sentryIssue("101")];
+
+    const result = await runCollect(deps("01:00"));
+
+    expect(result.status).toBe("done");
+    expect(result.steps).toEqual([
+      { target: "site-a", step: "vercel", ok: true },
+      { target: "site-a", step: "sentry", ok: true },
+      { target: "site-a", step: "sentry-status", ok: true },
+      { target: "site-a", step: "slack", ok: true },
+    ]);
+    expect(result.ingested.created).toBe(2);
+    expect(result.delivered).toEqual({ detailed: 2, bundled: 0, skipped: 0 });
+    expect(w.slack.map((m) => m.channel)).toEqual(["#ops-a", "#ops-a"]);
+    expect(w.slack[0].text).toContain("[P1][사이트 A] 배포 실패 (BUILD_FAILED)");
+    expect(result.heartbeat).toBe("sent");
+    expect(await getCursor(db, "site-a", "sentry")).toBe(at("01:00").toISOString());
+    expect(await getCursor(db, "site-a", "vercel")).toBe(at("01:00").toISOString());
+  });
+
+  it("빈 DB에서도 스키마를 먼저 만들고 실행한다", async () => {
+    const fresh = await createTestDb({ migrated: false });
+    try {
+      w.state.sentryIssues = [sentryIssue("101")];
+      const result = await runCollect(deps("01:00", { db: fresh.db }));
+      expect(result.status).toBe("done");
+      expect(result.ingested.created).toBe(1);
+    } finally {
+      fresh.cleanup();
+    }
+  });
+
+  it("배포를 Sentry보다 먼저 기록해 배포 직후 에러에 표시를 붙인다", async () => {
+    // 00:55에 공개된 배포, 00:58에 처음 생긴 에러
+    w.state.deployments = [deployment("dpl_1", "READY")];
+    w.state.sentryIssues = [sentryIssue("101")];
+
+    await runCollect(deps("01:00"));
+    expect(w.slack).toHaveLength(1);
+    expect(w.slack[0].body).toContain("배포 직후: 11/09 09:55에 공개된 배포 abcdef0");
+  });
+
+  it("같은 실행을 두 번 해도 알림은 한 번만 나간다", async () => {
+    w.state.deployments = [deployment("dpl_1", "ERROR")];
+    w.state.sentryIssues = [sentryIssue("101")];
+
+    await runCollect(deps("01:00"));
+    const second = await runCollect(deps("01:05"));
+
+    expect(w.slack).toHaveLength(2);
+    expect(second.delivered.detailed).toBe(0);
+    expect(second.heartbeat).toBe("sent");
+  });
+
+  it("Sentry가 실패해도 Vercel·Slack은 계속하고, 커서는 그대로 두고, heartbeat는 보내지 않는다", async () => {
+    w.state.deployments = [deployment("dpl_1", "ERROR")];
+    w.state.sentryIssues = [sentryIssue("101")];
+    w.state.fail.sentry = 500;
+
+    const result = await runCollect(deps("01:00"));
+
+    expect(result.steps).toEqual([
+      { target: "site-a", step: "vercel", ok: true },
+      { target: "site-a", step: "sentry", ok: false, reason: "server" },
+      { target: "site-a", step: "slack", ok: true },
+    ]);
+    // 수집이 실패했으니 Sentry 해결 확인도 하지 않는다
+    expect(w.calls.filter((c) => c.startsWith("sentry:status"))).toEqual([]);
+    expect(w.slack).toHaveLength(1);
+    expect(await getCursor(db, "site-a", "sentry")).toBeNull();
+    expect(result.heartbeat).toBe("skipped");
+    expect(w.calls).not.toContain("heartbeat");
+
+    // 다음 실행이 같은 구간을 다시 읽어 빠진 issue를 잡는다
+    w.state.fail.sentry = undefined;
+    const next = await runCollect(deps("01:05"));
+    expect(next.ingested.created).toBe(1);
+    expect(next.heartbeat).toBe("sent");
+  });
+
+  it("Vercel이 실패해도 Sentry는 계속하고 heartbeat는 보내지 않는다", async () => {
+    w.state.sentryIssues = [sentryIssue("101")];
+    w.state.fail.vercel = 401;
+
+    const result = await runCollect(deps("01:00"));
+    expect(result.steps[0]).toEqual({ target: "site-a", step: "vercel", ok: false, reason: "auth" });
+    expect(result.ingested.created).toBe(1);
+    expect(result.heartbeat).toBe("skipped");
+    expect(await getCursor(db, "site-a", "vercel")).toBeNull();
+  });
+
+  it("Slack이 실패하면 바로는 heartbeat를 보내고, 못 보낸 알림이 15분 넘게 쌓이면 멈춘다", async () => {
+    w.state.sentryIssues = [sentryIssue("101")];
+    w.state.fail.slack = "invalid_auth";
+
+    const first = await runCollect(deps("01:00"));
+    expect(first.steps.at(-1)).toEqual({ target: "site-a", step: "slack", ok: false, reason: "auth" });
+    expect(first.heartbeat).toBe("sent");
+
+    const later = await runCollect(deps("01:16"));
+    expect(later.heartbeat).toBe("skipped");
+    expect(await listPending(db, "site-a", at("01:16"))).toHaveLength(1);
+  });
+
+  it("다른 실행이 잠금을 잡고 있으면 아무것도 하지 않는다", async () => {
+    await acquireLock(db, "collect", "other-run", at("01:00"));
+    const result = await runCollect(deps("01:01"));
+
+    expect(result).toMatchObject({ status: "locked", steps: [], heartbeat: "skipped" });
+    expect(w.calls).toEqual([]);
+  });
+
+  it("끝나면 잠금을 푼다", async () => {
+    await runCollect(deps("01:00"));
+    expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
+  });
+
+  it("Sentry에서 해결·보관·삭제된 열린 incident를 닫는다", async () => {
+    w.state.sentryIssues = ["101", "102", "103", "104"].map((id) => sentryIssue(id));
+    await runCollect(deps("01:00"));
+
+    w.state.sentryIssues = [];
+    w.state.sentryStatus = { "101": "resolved", "102": "ignored", "103": 404, "104": "unresolved" };
+    const result = await runCollect(deps("01:05"));
+
+    expect(result.ingested.resolved).toBe(3);
+    const { rows } = await db.execute("SELECT fingerprint, status FROM incidents ORDER BY fingerprint");
+    expect(rows.map((r) => `${r.fingerprint}:${r.status}`)).toEqual([
+      "sentry:101:resolved",
+      "sentry:102:resolved",
+      "sentry:103:resolved",
+      "sentry:104:open",
+    ]);
+  });
+
+  it("열린 incident가 많으면 실행마다 나눠서 모두 확인한다", async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => String(200 + i));
+    w.state.sentryIssues = ids.map((id) => sentryIssue(id));
+    await runCollect(deps("01:00"));
+    w.state.sentryIssues = [];
+
+    const checked = new Set<string>();
+    for (const time of ["01:05", "01:10"]) {
+      w.calls.length = 0;
+      await runCollect(deps(time));
+      const run = w.calls.filter((c) => c.startsWith("sentry:status:"));
+      expect(run.length).toBe(STATUS_CHECK_LIMIT);
+      for (const call of run) checked.add(call.replace("sentry:status:", ""));
+    }
+    expect([...checked].sort()).toEqual(ids);
+  });
+
+  it("Sentry가 없는 사이트는 Vercel과 Slack만 한다", async () => {
+    w.state.deployments = [deployment("dpl_9", "ERROR")];
+    const result = await runCollect(deps("01:00", { targets: [NO_SENTRY], sentry: null }));
+
+    expect(result.steps.map((s) => s.step)).toEqual(["vercel", "slack"]);
+    expect(w.calls.filter((c) => c.startsWith("sentry"))).toEqual([]);
+    expect(w.slack.map((m) => m.channel)).toEqual(["#ops-b"]);
+    expect(result.heartbeat).toBe("sent");
+  });
+
+  it("사이트 하나가 실패해도 다른 사이트는 처리한다", async () => {
+    w.state.deployments = [deployment("dpl_1", "ERROR")];
+    w.state.fail.sentry = 503;
+    const result = await runCollect(deps("01:00", { targets: [TARGET, NO_SENTRY] }));
+
+    expect(result.steps.filter((s) => s.target === "site-b").every((s) => s.ok)).toBe(true);
+    expect(w.slack.map((m) => m.channel).sort()).toEqual(["#ops-a", "#ops-b"]);
+    expect(result.heartbeat).toBe("skipped");
+  });
+
+  it("heartbeat 주소가 없으면 보내지 않고, 핑이 실패하면 failed로 남긴다", async () => {
+    expect((await runCollect(deps("01:00", { heartbeatUrl: null }))).heartbeat).toBe("disabled");
+    w.state.fail.heartbeat = 500;
+    expect((await runCollect(deps("01:05"))).heartbeat).toBe("failed");
+  });
+
+  it("실행 예산을 넘기면 남은 요청을 끊고 heartbeat를 보내지 않는다", async () => {
+    const slow: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) reject(signal.reason);
+        signal?.addEventListener("abort", () => reject(signal.reason));
+      });
+
+    const result = await runCollect(deps("01:00", { fetchImpl: slow, budgetMs: 20 }));
+    expect(result.steps.filter((s) => s.step !== "slack").every((s) => !s.ok)).toBe(true);
+    expect(result.steps[0].reason).toBe("network");
+    expect(result.heartbeat).toBe("skipped");
+    expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
+  });
+});
+
+describe("rotate", () => {
+  it("limit보다 적으면 전부, 많으면 실행마다 limit씩 밀린 위치부터 자른다", () => {
+    const items = Array.from({ length: 12 }, (_, i) => i);
+    expect(rotate(items.slice(0, 3), at("01:00"), 10)).toEqual([0, 1, 2]);
+    const a = rotate(items, at("01:00"), 10);
+    const b = rotate(items, at("01:05"), 10);
+    expect(a).toHaveLength(10);
+    expect(new Set([...a, ...b]).size).toBe(12);
+  });
+});
+
+describe("reasonOf", () => {
+  it("밖으로 내보내는 이유는 고정된 문자열뿐이다", () => {
+    expect(reasonOf(new SourceError("sentry", "auth", 401))).toBe("auth");
+    expect(reasonOf(new SlackError("rate_limit", "ratelimited"))).toBe("rate_limit");
+    expect(reasonOf(new Error("libsql://secret-url token=abc"))).toBe("internal");
+    expect(reasonOf("문자열 오류")).toBe("internal");
+  });
+});

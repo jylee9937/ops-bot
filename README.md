@@ -35,7 +35,7 @@ Vercel webhook ─서명 검증─▶ ingest ◀─────┘
 - [x] 수집기와 마스킹
 - [x] incident 규칙
 - [x] Slack 알림과 버튼
-- [ ] collect와 heartbeat
+- [x] collect와 heartbeat
 - [ ] 배포 실패 webhook
 - [ ] Claude 요약과 평가
 - [ ] 통합 대시보드
@@ -57,6 +57,14 @@ pnpm dev
 | `pnpm build` | 프로덕션 빌드 |
 
 감시 대상은 코드가 아니라 `OPS_TARGETS` 환경변수로 받습니다. 형식은 `.env.example`과 `lib/targets.ts`를 보세요.
+
+### 운영 실행
+
+- `vercel.json`의 Cron이 5분마다 `GET /api/cron/collect`를 부릅니다(`Authorization: Bearer CRON_SECRET`).
+- 한 번의 실행: 잠금 → 스키마 확인 → 사이트마다 Vercel 배포 → Sentry issue → Sentry 해결 확인 → Slack 전송 → 정리 → heartbeat.
+- 출처 하나가 실패해도 나머지는 계속합니다. 실패한 출처는 커서를 옮기지 않아 다음 실행이 다시 읽습니다.
+- heartbeat는 모든 수집 단계가 성공하고 15분 넘게 못 보낸 알림이 없을 때만 보냅니다.
+- 응답에는 단계별 성공 여부와 건수만 담습니다. 설정이 틀리면 문제가 있는 변수 이름만 돌려줍니다.
 
 ### Slack 앱
 
