@@ -92,9 +92,15 @@ export function updateSnapshots(
   }).sort(([a], [b]) => Date.parse(a) - Date.parse(b));
 
   const baselineIndex = entries.findLastIndex(([key]) => Date.parse(key) <= cutoff);
-  const kept = entries.slice(Math.max(baselineIndex, 0));
-  return {
-    snapshots: Object.fromEntries(kept),
-    increase: Math.max(0, (kept.at(-1)?.[1] ?? count) - kept[0][1]),
-  };
+  const kept = Object.fromEntries(entries.slice(Math.max(baselineIndex, 0)));
+  return { snapshots: kept, increase: windowIncrease(kept) };
+}
+
+/** 저장된 버킷의 첫 값과 마지막 값 차이. 알림 제목의 '×N (10분)'에 쓴다. */
+export function windowIncrease(snapshots: CountSnapshots): number {
+  const values = Object.entries(snapshots)
+    .sort(([a], [b]) => Date.parse(a) - Date.parse(b))
+    .map(([, value]) => value);
+  if (values.length === 0) return 0;
+  return Math.max(0, values[values.length - 1] - values[0]);
 }

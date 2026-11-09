@@ -34,7 +34,7 @@ Vercel webhook ─서명 검증─▶ ingest ◀─────┘
 - [x] 프로젝트 기반: Next.js, Vitest, CI, DB 스키마, 감시 대상 설정
 - [x] 수집기와 마스킹
 - [x] incident 규칙
-- [ ] Slack 알림과 버튼
+- [x] Slack 알림과 버튼
 - [ ] collect와 heartbeat
 - [ ] 배포 실패 webhook
 - [ ] Claude 요약과 평가
@@ -57,3 +57,10 @@ pnpm dev
 | `pnpm build` | 프로덕션 빌드 |
 
 감시 대상은 코드가 아니라 `OPS_TARGETS` 환경변수로 받습니다. 형식은 `.env.example`과 `lib/targets.ts`를 보세요.
+
+### Slack 앱
+
+- 봇 토큰 권한: `chat:write`. 알림 채널마다 봇을 초대해야 보낼 수 있습니다.
+- Interactivity Request URL: `https://<배포 주소>/api/slack/actions`
+- 환경변수: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_OWNER_USER_ID`(버튼을 누를 수 있고 P1에 멘션할 사람)
+- 버튼은 ops-bot 상태만 바꿉니다. Sentry에는 쓰지 않습니다.

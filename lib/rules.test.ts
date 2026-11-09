@@ -8,6 +8,7 @@ import {
   higherOf,
   initialBaseline,
   updateSnapshots,
+  windowIncrease,
 } from "./rules";
 import type { Signal } from "./signal";
 import type { Target } from "./targets";
@@ -155,5 +156,22 @@ describe("updateSnapshots", () => {
   it("실행이 오래 빠져도 마지막 기준값으로 계산한다", () => {
     const before = updateSnapshots(baselineSnapshots(0, at("01:00")), 5, at("01:00"));
     expect(updateSnapshots(before.snapshots, 9, at("03:00")).increase).toBe(4);
+  });
+});
+
+describe("windowIncrease", () => {
+  it("시각 순서로 첫 값과 마지막 값의 차이를 돌려준다", () => {
+    expect(
+      windowIncrease({
+        "2026-11-07T01:05:00.000Z": 4,
+        "2026-11-07T00:55:00.000Z": 1,
+        "2026-11-07T01:00:00.000Z": 2,
+      }),
+    ).toBe(3);
+  });
+
+  it("버킷이 없거나 하나면 0이다", () => {
+    expect(windowIncrease({})).toBe(0);
+    expect(windowIncrease({ "2026-11-07T01:00:00.000Z": 5 })).toBe(0);
   });
 });

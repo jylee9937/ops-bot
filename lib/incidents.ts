@@ -1,4 +1,5 @@
 import type { Client, InStatement, Row } from "@libsql/client";
+import { createDb } from "./db";
 import { maskedFromStore, type MaskedText } from "./mask";
 import {
   baselineSnapshots,
@@ -26,6 +27,11 @@ const MAX_INGEST_ATTEMPTS = 3;
 const FINAL_DEPLOY_STATES = "'READY', 'ERROR', 'CANCELED', 'DELETED'";
 // 알림을 다시 보내야 하거나 보낼 필요가 없어지면 진행 중인 전송의 표를 무효로 만든다.
 const CLEAR_CLAIM = "notify_claimed_at = NULL, notify_claim = NULL";
+
+/** route가 쓰는 연결. 표는 계속 이 파일의 함수로만 읽고 쓴다. */
+export function openDb(): Client {
+  return createDb();
+}
 
 export type RelatedDeploy = {
   deploymentId: string;
