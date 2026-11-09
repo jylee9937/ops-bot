@@ -6,20 +6,26 @@ import type { Signal } from "./signal";
 import { postMessage } from "./slack";
 import type { Target } from "./targets";
 
-/** Vercel은 30초 안에 2xx를 기다린다. 새 Slack 전송은 이 안에서만 시작한다. */
-export const WEBHOOK_BUDGET_MS = 20_000;
+/**
+ * Vercel은 30초 안에 2xx를 기다린다. 요청이 들어온 뒤 15초 안에만 새 Slack 전송·재시도를 시작한다.
+ * 마지막 전송이 Slack 제한 10초를 다 써도 25초 안에 끝나고, 완료 기록할 여유가 남는다.
+ */
+export const WEBHOOK_SEND_WINDOW_MS = 15_000;
 
 export type WebhookDeps = Pick<CollectEnv, "slack"> & {
   db: Client;
   now?: () => Date;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  // 요청이 들어온 시각(ms). 예산은 여기서부터 센다. 없으면 이 함수를 부른 시각.
+  startedAt?: number;
 };
 
 export type WebhookResult = {
   ingested: IngestSummary;
   delivered: Pick<DeliveryResult, "detailed" | "bundled" | "skipped">;
-  // Slack 전송이 실패해도 webhook은 성공으로 끝낸다. incident는 저장됐고 다음 collect가 다시 보낸다.
+  // Slack 전송 실패·예산 종료면 webhook은 성공으로 끝낸다. incident는 저장됐고 다음 collect가 다시 보낸다.
+  // DB 오류는 여기 담지 않고 던진다.
   deliveryError: unknown;
 };
 
@@ -38,13 +44,17 @@ export async function handleDeployFailure(
   await prepareDb(db);
   const ingested = await ingest(db, target, [signal], now);
 
-  const deadline = Date.now() + WEBHOOK_BUDGET_MS;
+  const deadline = (deps.startedAt ?? Date.now()) + WEBHOOK_SEND_WINDOW_MS;
   const delivery = await deliverPending(
     db,
     target,
     now,
     (message) => postMessage(message, slack.token, { fetchImpl: deps.fetchImpl }),
-    { ownerUserId: slack.ownerUserId, sleep: deps.sleep, shouldStop: () => Date.now() >= deadline },
+    {
+      ownerUserId: slack.ownerUserId,
+      sleep: deps.sleep,
+      shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline,
+    },
   );
   return {
     ingested,

@@ -200,7 +200,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
           target,
           now,
           (message) => postMessage(message, slack.token, { fetchImpl: deps.fetchImpl }),
-          { ownerUserId: slack.ownerUserId, sleep: deps.sleep, shouldStop: () => Date.now() >= deadline },
+          { ownerUserId: slack.ownerUserId, sleep: deps.sleep, shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline },
         );
         result.delivered.detailed += delivery.detailed;
         result.delivered.bundled += delivery.bundled;

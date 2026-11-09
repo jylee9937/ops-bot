@@ -16,6 +16,7 @@ export const maxDuration = 30;
  * DB가 실패하면 500을 돌려 Vercel이 다시 보내게 한다. 응답에는 건수만 담는다.
  */
 export async function POST(request: Request): Promise<Response> {
+  const startedAt = Date.now();
   const secret = process.env.VERCEL_WEBHOOK_SECRET;
   if (!secret) return new Response(null, { status: 500 });
 
@@ -47,7 +48,7 @@ export async function POST(request: Request): Promise<Response> {
   let db: ReturnType<typeof openDb> | undefined;
   try {
     db = openDb();
-    const result = await handleDeployFailure(parsed.target, parsed.signal, { db, slack: env.slack });
+    const result = await handleDeployFailure(parsed.target, parsed.signal, { db, slack: env.slack, startedAt });
     const delivery = result.deliveryError ? reasonOf(result.deliveryError) : "ok";
     if (result.deliveryError) console.error(`[webhooks/vercel] ${parsed.target.id} Slack 전송 실패: ${delivery}`);
     console.info(`[webhooks/vercel] ${parsed.target.id} 배포 실패 처리 · 전송 ${result.delivered.detailed}건`);

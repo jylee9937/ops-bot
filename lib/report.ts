@@ -226,9 +226,17 @@ export type DeliveryOptions = {
   ownerUserId?: string;
   // 테스트에서 실제로 기다리지 않게 바꾼다.
   sleep?: (ms: number) => Promise<void>;
-  // 새 전송을 시작하기 전에만 확인한다. 보내는 중인 전송은 끊지 않는다(끊으면 Slack은 받았는데 다음 실행이 또 보낸다).
-  shouldStop?: () => boolean;
+  // 새 전송·재시도 대기를 시작하기 전에만 확인한다. `afterMs`는 그만큼 기다린 뒤에도 시간이 남는지 묻는다.
+  // 보내는 중인 전송은 끊지 않는다(끊으면 Slack은 받았는데 다음 실행이 또 보낸다).
+  shouldStop?: (afterMs?: number) => boolean;
 };
+
+/** 전송 자체의 실패(Slack 오류 등). DB 오류와 구분해 전송 실패로만 남기려고 감싼다. */
+class SendFailed extends Error {
+  constructor(readonly original: unknown) {
+    super("Slack 전송 실패");
+  }
+}
 
 /** 실행 예산이 끝나 남은 전송을 다음 실행에 맡겼다. */
 export class DeliveryStopped extends Error {
@@ -246,6 +254,7 @@ async function sendWithRetry(
   send: Send,
   message: SlackMessage,
   sleep: (ms: number) => Promise<void>,
+  shouldStop: (afterMs?: number) => boolean,
 ): Promise<{ ts: string }> {
   try {
     return await send(message);
@@ -255,7 +264,9 @@ async function sendWithRetry(
       error instanceof SlackError &&
       error.reason === "rate_limit" &&
       retryAfter !== undefined &&
-      retryAfter <= MAX_RETRY_WAIT_MS
+      retryAfter <= MAX_RETRY_WAIT_MS &&
+      // 기다린 뒤 다시 보낼 시간이 없으면 다음 실행에 맡긴다
+      !shouldStop(retryAfter)
     ) {
       await sleep(retryAfter);
       return send(message);
@@ -288,7 +299,11 @@ export async function deliverPending(
     if (sentBefore) await sleep(SEND_INTERVAL_MS);
     if (shouldStop()) throw new DeliveryStopped();
     sentBefore = true;
-    return sendWithRetry(send, message, sleep);
+    try {
+      return await sendWithRetry(send, message, sleep, shouldStop);
+    } catch (error) {
+      throw new SendFailed(error);
+    }
   };
 
   try {
@@ -319,7 +334,11 @@ export async function deliverPending(
       }
     }
   } catch (error) {
-    result.error = error;
+    // 전송 실패·예산 종료만 결과로 남긴다. DB 오류는 던져 호출한 쪽이 실패로 처리하게 한다
+    // (webhook은 500을 돌려 Vercel이 다시 보낸다). 어느 쪽이든 표는 아래에서 돌려준다.
+    if (error instanceof SendFailed) result.error = error.original;
+    else if (error instanceof DeliveryStopped) result.error = error;
+    else throw error;
   } finally {
     await releaseClaim(db, claim);
   }

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTestDb } from "./__fixtures__/test-db";
 import { runCollect } from "./collect";
 import { listPending, resolveIncident } from "./incidents";
+import type { Client as LibsqlClient } from "@libsql/client";
 import { deployFailedSignal } from "./sources/vercel";
 import type { Target } from "./targets";
 import { handleDeployFailure } from "./webhook";
@@ -121,6 +122,67 @@ describe("handleDeployFailure", () => {
     const result = await handle("01:00");
     expect(result.ingested.created).toBe(1);
     expect(result.deliveryError).toBeInstanceOf(Error);
+    expect(await listPending(db, "site-a", at("01:01"))).toHaveLength(1);
+  });
+
+  it("[리뷰 1] 미래 시각(허용 오차 안) 이벤트를 해결 뒤 다시 보내도 다시 열지 않는다", async () => {
+    // 서버 시각 01:00, 이벤트 시각 01:04(5분 허용 오차 안)
+    await handle("01:00", failed("01:04"));
+    await resolveIncident(db, "site-a", "vercel:dpl_Failed01:ERROR", at("01:01"));
+    const replay = await handle("01:02", failed("01:04"));
+
+    expect(replay.ingested.reopened).toBe(0);
+    expect(slack.sent).toHaveLength(1);
+    const { rows } = await db.execute("SELECT status, episode FROM incidents");
+    expect(rows[0]).toMatchObject({ status: "resolved", episode: 1 });
+  });
+
+  it("[리뷰 2] 요청이 들어온 뒤 새 전송을 시작할 시간이 지났으면 보내지 않고 collect에 맡긴다", async () => {
+    const result = await handleDeployFailure(TARGET, failed(), {
+      db,
+      slack: SLACK,
+      fetchImpl: slack.impl,
+      sleep: async () => {},
+      now: () => at("01:00"),
+      startedAt: Date.now() - 16_000,
+    });
+    expect(result.ingested.created).toBe(1);
+    expect(result.delivered.detailed).toBe(0);
+    expect(slack.sent).toEqual([]);
+    expect(await listPending(db, "site-a", at("01:01"))).toHaveLength(1);
+  });
+
+  it("[리뷰 3] 전송 단계의 DB 오류는 삼키지 않고 던진다(route가 500을 돌려 Vercel이 다시 보냄)", async () => {
+    let broken = true;
+    const flaky = new Proxy(db, {
+      get(target, property) {
+        if (property === "execute") {
+          return async (...args: Parameters<LibsqlClient["execute"]>) => {
+            const [statement] = args as unknown as [string | { sql: string }];
+            const sql = typeof statement === "string" ? statement : statement.sql;
+            if (broken && sql.includes("SELECT * FROM incidents") && sql.includes("WHERE id = ? AND notify_claim = ?")) {
+              broken = false;
+              throw new Error("db unavailable");
+            }
+            return target.execute(...args);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      handleDeployFailure(TARGET, failed(), {
+        db: flaky,
+        slack: SLACK,
+        fetchImpl: slack.impl,
+        sleep: async () => {},
+        now: () => at("01:00"),
+      }),
+    ).rejects.toThrow("db unavailable");
+    expect(slack.sent).toEqual([]);
+    // 표는 돌려줘 다음 실행이 보낼 수 있다
     expect(await listPending(db, "site-a", at("01:01"))).toHaveLength(1);
   });
 
