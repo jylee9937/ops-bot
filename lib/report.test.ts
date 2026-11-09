@@ -263,6 +263,15 @@ describe("report", () => {
 
       expect(actionsOf(resolved)).toEqual([]);
       expect(resolved.text.startsWith("[P1]")).toBe(true);
+
+      // 이미 보낸 incident여도 '다시 알림'으로 바뀌지 않는다(E2E에서 발견). 알림 이유는 뺀다.
+      const sent = { ...incident, slackTs: "1700000000.000001" };
+      const redrawn = allText(
+        incidentMessage(TARGET, sent, { state: { kind: "resolved", at: at("02:00"), by: OWNER } }),
+      );
+      expect(redrawn).not.toContain("다시 알림");
+      expect(redrawn).not.toContain("새 에러");
+      expect(redrawn).toContain("영역 인증");
       expect(allText(resolved)).toContain(`해결 처리 · 11/07 11:00 · <@${OWNER}>`);
       expect(allText(muted)).toContain("11/07 12:00까지 음소거");
     });

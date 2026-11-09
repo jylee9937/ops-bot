@@ -93,9 +93,14 @@ function reason(incident: Incident): string {
   return "새 에러";
 }
 
-function details(incident: Incident): string[] {
+/**
+ * 본문 줄. 버튼을 누른 뒤 다시 그릴 때(`withReason: false`)는 알림 이유를 뺀다.
+ * 그때는 이미 보낸 incident라 '다시 알림'으로 잘못 바뀌고, 어느 알림의 버튼인지도 알 수 없다.
+ */
+function details(incident: Incident, withReason: boolean): string[] {
   const { evidence } = incident;
-  const lines = [`${reason(incident)} · 영역 ${escapeSlack(incident.area)}`];
+  const area = `영역 ${escapeSlack(incident.area)}`;
+  const lines = [withReason ? `${reason(incident)} · ${area}` : area];
   if (evidence.source === "sentry") {
     lines.push(`누적 ${evidence.count}회 · 영향 사용자 ${evidence.users}명`);
   }
@@ -150,7 +155,7 @@ export function incidentMessage(
 ): SlackMessage {
   const call = !state && incident.severity === "P1" ? mention(ownerUserId) : "";
   const title = headline(target, incident);
-  const body = [`${call}*${title}*`, ...details(incident)].join("\n");
+  const body = [`${call}*${title}*`, ...details(incident, !state)].join("\n");
 
   const blocks: SlackBlock[] = [{ type: "section", text: mrkdwn(clip(body, SECTION_LIMIT)) }];
   blocks.push(
