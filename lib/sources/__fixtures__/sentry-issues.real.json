@@ -1,0 +1,77 @@
+[
+  {
+    "id": "4100000001",
+    "shareId": null,
+    "shortId": "EXAMPLE-PROD-C",
+    "title": "Error: [articles] ops-bot E2E 시험 이벤트 010-1234-5678 test@example.com",
+    "culprit": "",
+    "permalink": "https://example-org.sentry.io/issues/4100000001/",
+    "logger": "ops-bot-e2e",
+    "level": "error",
+    "status": "unresolved",
+    "statusDetails": {},
+    "substatus": "new",
+    "isPublic": false,
+    "platform": "javascript",
+    "project": {
+      "id": "1",
+      "name": "example-prod",
+      "slug": "example-prod",
+      "platform": "javascript-nextjs"
+    },
+    "type": "error",
+    "metadata": {
+      "value": "[articles] ops-bot E2E 시험 이벤트 010-1234-5678 test@example.com",
+      "type": "Error",
+      "synthetic": false,
+      "sdk": {
+        "name": "ops-bot-e2e",
+        "name_normalized": "other"
+      },
+      "initial_priority": 75
+    },
+    "numComments": 0,
+    "assignedTo": null,
+    "isBookmarked": false,
+    "isSubscribed": false,
+    "subscriptionDetails": null,
+    "hasSeen": false,
+    "annotations": [],
+    "issueType": "error",
+    "issueCategory": "error",
+    "priority": "high",
+    "priorityLockedAt": null,
+    "seerFixabilityScore": null,
+    "seerAutofixLastTriggered": null,
+    "seerExplorerAutofixLastTriggered": null,
+    "isUnhandled": false,
+    "count": "1",
+    "userCount": 1,
+    "firstSeen": "2026-11-09T05:36:57Z",
+    "lastSeen": "2026-11-09T05:36:57Z",
+    "stats": {
+      "24h": [
+        [
+          1794193200,
+          0
+        ],
+        [
+          1794196800,
+          0
+        ],
+        [
+          1794200400,
+          1
+        ]
+      ]
+    },
+    "lifetime": {
+      "count": "1",
+      "userCount": 1,
+      "firstSeen": "2026-11-09T05:36:57.193424Z",
+      "lastSeen": "2026-11-09T05:36:57Z",
+      "stats": null
+    },
+    "filtered": null
+  }
+]

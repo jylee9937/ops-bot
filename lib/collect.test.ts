@@ -128,8 +128,8 @@ describe("runCollect", () => {
 
     expect(result.status).toBe("done");
     expect(result.steps).toEqual([
-      { target: "site-a", step: "vercel", ok: true },
-      { target: "site-a", step: "sentry", ok: true },
+      { target: "site-a", step: "vercel", ok: true, received: 2, skipped: 0 },
+      { target: "site-a", step: "sentry", ok: true, received: 1, skipped: 0 },
       { target: "site-a", step: "sentry-status", ok: true },
       { target: "site-a", step: "slack", ok: true },
     ]);
@@ -184,7 +184,7 @@ describe("runCollect", () => {
     const result = await runCollect(deps("01:00"));
 
     expect(result.steps).toEqual([
-      { target: "site-a", step: "vercel", ok: true },
+      { target: "site-a", step: "vercel", ok: true, received: 1, skipped: 0 },
       { target: "site-a", step: "sentry", ok: false, reason: "server" },
       { target: "site-a", step: "slack", ok: true },
     ]);
@@ -200,6 +200,28 @@ describe("runCollect", () => {
     const next = await runCollect(deps("01:05"));
     expect(next.ingested.created).toBe(1);
     expect(next.heartbeat).toBe("sent");
+  });
+
+  it("형식이 다른 issue는 건너뛰되 그 단계를 실패로 남겨 heartbeat를 막는다", async () => {
+    // collapse=stats 응답처럼 count·userCount·firstSeen·lastSeen이 빠진 issue
+    const { count: _count, userCount: _users, firstSeen: _first, lastSeen: _last, ...stripped } = sentryIssue("900");
+    w.state.sentryIssues = [stripped, sentryIssue("101")];
+
+    const result = await runCollect(deps("01:00"));
+
+    expect(result.steps[1]).toEqual({
+      target: "site-a",
+      step: "sentry",
+      ok: false,
+      reason: "invalid_items",
+      received: 1,
+      skipped: 1,
+    });
+    // 요청은 성공했으니 나머지는 처리하고 해결 확인도 한다
+    expect(result.ingested.created).toBe(1);
+    expect(result.steps.map((s) => s.step)).toContain("sentry-status");
+    expect(await getCursor(db, "site-a", "sentry")).toBe(at("01:00").toISOString());
+    expect(result.heartbeat).toBe("skipped");
   });
 
   it("Vercel이 실패해도 Sentry는 계속하고 heartbeat는 보내지 않는다", async () => {

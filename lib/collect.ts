@@ -31,7 +31,19 @@ const CRON_INTERVAL_MS = 5 * 60_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 
 export type Step = "vercel" | "sentry" | "sentry-status" | "slack";
-export type StepResult = { target: string; step: Step; ok: boolean; reason?: string };
+/**
+ * 수집 단계는 받은 항목 수와 형식이 달라 건너뛴 수를 함께 남긴다.
+ * 건너뛴 항목이 있으면 그 단계는 실패로 본다. 외부 응답 형식이 바뀌어 전부 걸러져도 조용히 지나가지 않게 한다.
+ */
+export type StepResult = {
+  target: string;
+  step: Step;
+  ok: boolean;
+  reason?: string;
+  received?: number;
+  skipped?: number;
+};
+type Counts = { received: number; skipped: number };
 
 export type CollectResult = {
   status: "done" | "locked";
@@ -100,10 +112,17 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
   const holder = deps.holder ?? crypto.randomUUID();
   if (!(await acquireLock(db, LOCK_NAME, holder, now))) return { ...result, status: "locked" };
 
-  const run = async (target: Target, step: Step, work: () => Promise<void>) => {
+  /** 단계를 실행하고 결과를 남긴다. 돌려주는 값은 요청 자체가 성공했는지다(건너뛴 항목과 무관). */
+  const run = async (target: Target, step: Step, work: () => Promise<Counts | void>) => {
     try {
-      await work();
-      result.steps.push({ target: target.id, step, ok: true });
+      const counts = await work();
+      const entry: StepResult = { target: target.id, step, ok: true, ...(counts ?? {}) };
+      if (counts && counts.skipped > 0) {
+        entry.ok = false;
+        entry.reason = "invalid_items";
+        console.error(`[collect] ${target.id} ${step}: 형식이 다른 항목 ${counts.skipped}건을 건너뜀`);
+      }
+      result.steps.push(entry);
       return true;
     } catch (error) {
       const reason = reasonOf(error);
@@ -122,6 +141,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
         await recordDeploys(db, collected.deploys, now);
         addSummary(result.ingested, await ingest(db, target, collected.signals, now));
         if (collected.nextCursor) await saveCursor(db, target.id, "vercel", collected.nextCursor, now);
+        return { received: collected.deploys.length, skipped: collected.skipped };
       });
 
       if (target.sentry && sentry) {
@@ -131,9 +151,11 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
           const collected = await collectSentry(target.id, sentryTarget, sentry, { cursor, now, ...request });
           addSummary(result.ingested, await ingest(db, target, collected.signals, now));
           if (collected.nextCursor) await saveCursor(db, target.id, "sentry", collected.nextCursor, now);
+          return { received: collected.signals.length, skipped: collected.skipped };
         });
 
-        // 토큰이 이 사이트를 읽을 수 있을 때만 확인한다. 권한 문제로 404가 나면 전부 해결로 잘못 닫힌다.
+        // 목록 요청이 성공해 토큰이 이 사이트를 읽을 수 있을 때만 확인한다.
+        // 권한 문제로 404가 나면 전부 해결로 잘못 닫힌다. 건너뛴 항목이 있어도 요청은 성공한 것이다.
         if (collectedOk) {
           await run(target, "sentry-status", async () => {
             const open = await listOpenSentryIncidents(db, target.id, MAX_OPEN_SCAN);

@@ -132,7 +132,7 @@ export async function collectSentry(
     url.searchParams.set("query", `lastSeen:>${since}`);
     url.searchParams.set("sort", "date");
     url.searchParams.set("limit", PAGE_SIZE);
-    url.searchParams.set("collapse", "stats");
+    // collapse=stats는 쓰지 않는다. 통계와 함께 count·userCount·firstSeen·lastSeen까지 빠진다(T9 E2E에서 확인).
     if (pageCursor) url.searchParams.set("cursor", pageCursor);
 
     const { body, headers } = await getJson("sentry", url, config.token, request);
