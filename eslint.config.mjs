@@ -8,7 +8,15 @@ const eslintConfig = defineConfig([
   // 표의 주인은 lib/incidents.ts 하나다. route나 다른 모듈이 직접 쿼리하지 않는다.
   {
     files: ["**/*.{ts,tsx}"],
-    ignores: ["lib/db.ts", "lib/db.test.ts", "lib/incidents.ts", "lib/incidents.test.ts", "scripts/**"],
+    // 예외: 스키마 소유자와 테스트용 임시 DB 도우미
+    ignores: [
+      "lib/db.ts",
+      "lib/db.test.ts",
+      "lib/incidents.ts",
+      "lib/incidents.test.ts",
+      "lib/__fixtures__/test-db.ts",
+      "scripts/**",
+    ],
     rules: {
       "no-restricted-imports": [
         "error",
@@ -42,7 +50,13 @@ const eslintConfig = defineConfig([
     },
   },
   {
-    files: ["lib/db.ts", "lib/db.test.ts", "lib/incidents.ts", "lib/incidents.test.ts"],
+    files: [
+      "lib/db.ts",
+      "lib/db.test.ts",
+      "lib/incidents.ts",
+      "lib/incidents.test.ts",
+      "lib/__fixtures__/test-db.ts",
+    ],
     rules: {
       "no-restricted-imports": [
         "error",
