@@ -4,6 +4,9 @@ import { fakeFetch, jsonResponse } from "./__fixtures__/fake-fetch";
 import latestEvent from "./__fixtures__/sentry-event-latest.json";
 import page1 from "./__fixtures__/sentry-issues.page1.json";
 import page2 from "./__fixtures__/sentry-issues.page2.json";
+// 실제 응답(2026-11-09 T9 E2E, 시험 이벤트)에서 org·프로젝트 이름과 id만 예시 값으로 바꾼 것
+import collapsedPage from "./__fixtures__/sentry-issues.collapsed.json";
+import realPage from "./__fixtures__/sentry-issues.real.json";
 import { collectSentry, fetchSentryFrames, fetchSentryIssueStatus } from "./sentry";
 import { MAX_PAGES } from "./shared";
 
@@ -44,6 +47,8 @@ describe("collectSentry 요청", () => {
     expect(url.searchParams.get("query")).toBe("lastSeen:>2026-11-07T00:45:00Z");
     expect(url.searchParams.get("sort")).toBe("date");
     expect(url.searchParams.get("limit")).toBe("100");
+    // collapse=stats는 count·firstSeen·lastSeen까지 빼므로 보내지 않는다
+    expect(url.searchParams.has("collapse")).toBe(false);
     expect(fetch.authorization[0]).toBe("Bearer sentry-secret");
   });
 
@@ -273,5 +278,47 @@ describe("fetchSentryIssueStatus", () => {
     await expect(fetchSentryIssueStatus(CONFIG, "1001", { fetchImpl: fetch.impl })).rejects.toMatchObject({
       reason: "invalid_response",
     });
+  });
+});
+
+describe("collectSentry 실제 응답 모양", () => {
+  it("실제 issue 응답을 읽고 제목의 전화번호·이메일을 지운다", async () => {
+    const now = new Date("2026-11-09T05:40:00.000Z");
+    const fetch = fakeFetch([jsonResponse(realPage)]);
+    const { signals, skipped } = await collectSentry("site-a", SENTRY, CONFIG, {
+      cursor: null,
+      now,
+      fetchImpl: fetch.impl,
+    });
+
+    expect(skipped).toBe(0);
+    expect(signals).toEqual([
+      {
+        target: "site-a",
+        source: "sentry",
+        kind: "issue.new",
+        fingerprint: "sentry:4100000001",
+        sourceId: "4100000001",
+        title: "[articles] ops-bot E2E 시험 이벤트 [전화번호] [이메일] (Error)",
+        tag: "articles",
+        route: null,
+        count: 1,
+        users: 1,
+        firstSeen: "2026-11-09T05:36:57.000Z",
+        lastSeen: "2026-11-09T05:36:57.000Z",
+        link: "https://example-org.sentry.io/issues/4100000001/",
+      },
+    ]);
+  });
+
+  it("collapse=stats 응답은 count·firstSeen·lastSeen이 없어 건너뛴다", async () => {
+    const fetch = fakeFetch([jsonResponse(collapsedPage)]);
+    const { signals, skipped } = await collectSentry("site-a", SENTRY, CONFIG, {
+      cursor: null,
+      now: NOW,
+      fetchImpl: fetch.impl,
+    });
+    expect(signals).toEqual([]);
+    expect(skipped).toBe(1);
   });
 });

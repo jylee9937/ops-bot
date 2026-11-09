@@ -716,6 +716,13 @@ describe("incidents", () => {
       expect(await isDeliveryOverdue(db, at("01:15"))).toBe(true);
     });
 
+    it("사이트 범위를 주면 그 사이트만 본다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      expect(await isDeliveryOverdue(db, at("01:15"), ["site-a"])).toBe(true);
+      expect(await isDeliveryOverdue(db, at("01:15"), ["site-b"])).toBe(false);
+      expect(await isDeliveryOverdue(db, at("01:15"), [])).toBe(false);
+    });
+
     it("새 발생이 이어져도 대기 시간은 처음부터 잰다", async () => {
       await ingest(db, TARGET, [issue({ count: 1 })], at("01:00"));
       await ingest(db, TARGET, [issue({ count: 1, lastSeen: iso("01:14") })], at("01:14"));
@@ -870,9 +877,10 @@ describe("incidents", () => {
 
   describe("잠금", () => {
     it("잡혀 있으면 실패하고 만료되면 잡을 수 있다", async () => {
+      // TTL 3분: collect의 maxDuration(120초)보다 길고 Cron 주기(5분)보다 짧다
       expect(await acquireLock(db, "collect", "run-1", at("01:00"))).toBe(true);
-      expect(await acquireLock(db, "collect", "run-2", at("01:04"))).toBe(false);
-      expect(await acquireLock(db, "collect", "run-2", at("01:05"))).toBe(true);
+      expect(await acquireLock(db, "collect", "run-2", at("01:02"))).toBe(false);
+      expect(await acquireLock(db, "collect", "run-2", at("01:03"))).toBe(true);
     });
 
     it("동시에 잡아도 하나만 성공한다", async () => {

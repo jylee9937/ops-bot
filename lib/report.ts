@@ -93,9 +93,14 @@ function reason(incident: Incident): string {
   return "새 에러";
 }
 
-function details(incident: Incident): string[] {
+/**
+ * 본문 줄. 버튼을 누른 뒤 다시 그릴 때(`withReason: false`)는 알림 이유를 뺀다.
+ * 그때는 이미 보낸 incident라 '다시 알림'으로 잘못 바뀌고, 어느 알림의 버튼인지도 알 수 없다.
+ */
+function details(incident: Incident, withReason: boolean): string[] {
   const { evidence } = incident;
-  const lines = [`${reason(incident)} · 영역 ${escapeSlack(incident.area)}`];
+  const area = `영역 ${escapeSlack(incident.area)}`;
+  const lines = [withReason ? `${reason(incident)} · ${area}` : area];
   if (evidence.source === "sentry") {
     lines.push(`누적 ${evidence.count}회 · 영향 사용자 ${evidence.users}명`);
   }
@@ -150,7 +155,7 @@ export function incidentMessage(
 ): SlackMessage {
   const call = !state && incident.severity === "P1" ? mention(ownerUserId) : "";
   const title = headline(target, incident);
-  const body = [`${call}*${title}*`, ...details(incident)].join("\n");
+  const body = [`${call}*${title}*`, ...details(incident, !state)].join("\n");
 
   const blocks: SlackBlock[] = [{ type: "section", text: mrkdwn(clip(body, SECTION_LIMIT)) }];
   blocks.push(
@@ -221,7 +226,18 @@ export type DeliveryOptions = {
   ownerUserId?: string;
   // 테스트에서 실제로 기다리지 않게 바꾼다.
   sleep?: (ms: number) => Promise<void>;
+  // 새 전송을 시작하기 전에만 확인한다. 보내는 중인 전송은 끊지 않는다(끊으면 Slack은 받았는데 다음 실행이 또 보낸다).
+  shouldStop?: () => boolean;
 };
+
+/** 실행 예산이 끝나 남은 전송을 다음 실행에 맡겼다. */
+export class DeliveryStopped extends Error {
+  override name = "TimeoutError";
+
+  constructor() {
+    super("실행 예산이 끝나 남은 전송을 멈췄습니다");
+  }
+}
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -259,7 +275,7 @@ export async function deliverPending(
   target: Target,
   now: Date,
   send: Send,
-  { ownerUserId, sleep = wait }: DeliveryOptions = {},
+  { ownerUserId, sleep = wait, shouldStop = () => false }: DeliveryOptions = {},
 ): Promise<DeliveryResult> {
   const result: DeliveryResult = { detailed: 0, bundled: 0, skipped: 0, error: null };
   const { claim, incidents } = await claimPending(db, target.id, now);
@@ -270,6 +286,7 @@ export async function deliverPending(
   // 모두 같은 채널로 간다. 이어 보낼 때 간격을 둔다.
   const paced = async (message: SlackMessage) => {
     if (sentBefore) await sleep(SEND_INTERVAL_MS);
+    if (shouldStop()) throw new DeliveryStopped();
     sentBefore = true;
     return sendWithRetry(send, message, sleep);
   };
