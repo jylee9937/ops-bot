@@ -107,4 +107,18 @@ describe("loadCollectEnv", () => {
       expect(message).toBe("환경변수를 확인하세요: SLACK_BOT_TOKEN, VERCEL_TEAM_ID");
     }
   });
+
+  it("[리뷰 P3-6] 원격 DB면 Turso 토큰이 필요하고, 로컬 파일이면 없어도 된다", () => {
+    expect(keysOf(() => loadCollectEnv(env({ TURSO_DATABASE_URL: "libsql://db-example.turso.io" })))).toEqual([
+      "TURSO_AUTH_TOKEN",
+    ]);
+    expect(() =>
+      loadCollectEnv(env({ TURSO_DATABASE_URL: "libsql://db-example.turso.io", TURSO_AUTH_TOKEN: "turso-token" })),
+    ).not.toThrow();
+    expect(() => loadCollectEnv(env({ TURSO_DATABASE_URL: "file:./local.db" }))).not.toThrow();
+  });
+
+  it("[리뷰 P3-6] Sentry org slug에 밑줄을 허용한다", () => {
+    expect(loadCollectEnv(env({ SENTRY_ORG: "example_org" })).sentry?.org).toBe("example_org");
+  });
 });

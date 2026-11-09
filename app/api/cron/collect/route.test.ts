@@ -99,6 +99,23 @@ describe("GET /api/cron/collect", () => {
     expect((await call("Bearer short")).status).toBe(500);
   });
 
+  it("[리뷰 P3-5] DB 연결을 열다 실패해도 500으로 끝내고 원문을 내보내지 않는다", async () => {
+    vi.stubEnv("TURSO_DATABASE_URL", "::not-a-db-url-with-secret::");
+    vi.stubEnv("TURSO_AUTH_TOKEN", "turso-token");
+    const errors: unknown[][] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args) => {
+      errors.push(args);
+    });
+    try {
+      const response = await call(`Bearer ${SECRET}`);
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ error: "internal" });
+      expect(JSON.stringify(errors)).not.toContain("not-a-db-url-with-secret");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("설정이 틀리면 변수 이름만 돌려주고 값은 내보내지 않는다", async () => {
     vi.stubEnv("SLACK_BOT_TOKEN", "xoxp-leaked-user-token");
     vi.stubEnv("VERCEL_TEAM_ID", "");

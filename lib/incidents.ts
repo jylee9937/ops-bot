@@ -19,7 +19,8 @@ const CORRELATION_WINDOW_MS = 5 * 60_000;
 // Vercel 함수 제한 시간보다 길다. 이 시간이 지난 전송 표시는 함수가 죽은 것으로 본다.
 const CLAIM_TTL_MS = 10 * 60_000;
 const DELIVERY_OVERDUE_MS = 15 * 60_000;
-const LOCK_TTL_MS = 5 * 60_000;
+// collect route의 maxDuration(120초)보다 길고 Cron 주기(5분)보다 짧다. 함수가 죽어 잠금이 남아도 다음 회차는 돈다.
+const LOCK_TTL_MS = 3 * 60_000;
 const RETENTION_MS = 180 * 24 * 60 * 60_000;
 const MAX_INGEST_ATTEMPTS = 3;
 
@@ -601,13 +602,23 @@ export async function releaseNotification(db: Client, id: number, claim: string)
   });
 }
 
-/** 보내지 못한 incident가 15분 넘게 쌓였으면 true. 이때는 heartbeat를 보내지 않는다. */
-export async function isDeliveryOverdue(db: Client, now: Date): Promise<boolean> {
+/**
+ * 보내지 못한 incident가 15분 넘게 쌓였으면 true. 이때는 heartbeat를 보내지 않는다.
+ * `targetIds`를 주면 그 사이트만 본다. 설정에서 뺀 사이트의 incident는 더 보낼 곳이 없어
+ * 영원히 남으므로, collect는 지금 설정된 사이트만 넘긴다.
+ */
+export async function isDeliveryOverdue(
+  db: Client,
+  now: Date,
+  targetIds?: readonly string[],
+): Promise<boolean> {
+  if (targetIds && targetIds.length === 0) return false;
+  const scope = targetIds ? `AND target IN (${targetIds.map(() => "?").join(", ")})` : "";
   const { rows } = await db.execute({
     sql: `SELECT 1 FROM incidents
-          WHERE status = 'open' AND notified_at IS NULL AND pending_since <= ?
+          WHERE status = 'open' AND notified_at IS NULL AND pending_since <= ? ${scope}
           LIMIT 1`,
-    args: [isoBefore(now, DELIVERY_OVERDUE_MS)],
+    args: [isoBefore(now, DELIVERY_OVERDUE_MS), ...(targetIds ?? [])],
   });
   return rows.length > 0;
 }

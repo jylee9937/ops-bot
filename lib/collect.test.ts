@@ -2,7 +2,8 @@ import type { Client } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTestDb } from "./__fixtures__/test-db";
 import { reasonOf, rotate, runCollect, STATUS_CHECK_LIMIT, type CollectDeps } from "./collect";
-import { acquireLock, getCursor, listPending } from "./incidents";
+import { acquireLock, getCursor, ingest, listPending } from "./incidents";
+import { maskLogMessage } from "./mask";
 import { SlackError } from "./slack";
 import { SourceError } from "./sources/shared";
 import type { Target } from "./targets";
@@ -204,7 +205,9 @@ describe("runCollect", () => {
 
   it("형식이 다른 issue는 건너뛰되 그 단계를 실패로 남겨 heartbeat를 막는다", async () => {
     // collapse=stats 응답처럼 count·userCount·firstSeen·lastSeen이 빠진 issue
-    const { count: _count, userCount: _users, firstSeen: _first, lastSeen: _last, ...stripped } = sentryIssue("900");
+    const stripped = Object.fromEntries(
+      Object.entries(sentryIssue("900")).filter(([key]) => !["count", "userCount", "firstSeen", "lastSeen"].includes(key)),
+    );
     w.state.sentryIssues = [stripped, sentryIssue("101")];
 
     const result = await runCollect(deps("01:00"));
@@ -220,8 +223,117 @@ describe("runCollect", () => {
     // 요청은 성공했으니 나머지는 처리하고 해결 확인도 한다
     expect(result.ingested.created).toBe(1);
     expect(result.steps.map((s) => s.step)).toContain("sentry-status");
-    expect(await getCursor(db, "site-a", "sentry")).toBe(at("01:00").toISOString());
+    // [리뷰 P2-2] 커서를 옮기지 않는다. 옮기면 그 항목이 다시 읽히지 않아 15분 뒤 heartbeat가 저절로 돌아온다
+    expect(await getCursor(db, "site-a", "sentry")).toBeNull();
     expect(result.heartbeat).toBe("skipped");
+
+    const later = await runCollect(deps("01:20"));
+    expect(later.steps[1]).toMatchObject({ ok: false, reason: "invalid_items" });
+    expect(later.heartbeat).toBe("skipped");
+    expect(w.slack).toHaveLength(1);
+
+    // 형식이 맞게 바뀌면 커서가 옮겨지고 heartbeat가 돌아온다
+    w.state.sentryIssues = [sentryIssue("101")];
+    const fixed = await runCollect(deps("01:25"));
+    expect(fixed.heartbeat).toBe("sent");
+    expect(await getCursor(db, "site-a", "sentry")).toBe(at("01:25").toISOString());
+  });
+
+  it("[리뷰 P2-2] 형식이 다른 배포가 있으면 Vercel 커서도 옮기지 않는다", async () => {
+    w.state.deployments = [{ created: at("00:50").getTime(), target: "production" }, deployment("dpl_1", "READY")];
+    const result = await runCollect(deps("01:00"));
+    expect(result.steps[0]).toMatchObject({ step: "vercel", ok: false, reason: "invalid_items", received: 1, skipped: 1 });
+    expect(await getCursor(db, "site-a", "vercel")).toBeNull();
+  });
+
+  it("[리뷰 P2-1] 설정에서 뺀 사이트의 못 보낸 알림은 heartbeat를 막지 않는다", async () => {
+    const OLD: Target = { ...NO_SENTRY, id: "site-old", slackChannel: "#ops-old" };
+    w.state.deployments = [deployment("dpl_old", "ERROR")];
+    w.state.fail.slack = "invalid_auth";
+    await runCollect(deps("01:00", { targets: [OLD], sentry: null }));
+
+    // 운영자가 site-old를 설정에서 뺐다. 그 incident는 더 보낼 곳이 없다
+    w.state.deployments = [];
+    w.state.fail.slack = undefined;
+    const result = await runCollect(deps("01:20"));
+    expect(result.heartbeat).toBe("sent");
+  });
+
+  it("[리뷰 P3-2] 예산이 끝나도 보내는 중인 Slack 전송은 끊지 않아 다음 실행이 다시 보내지 않는다", async () => {
+    w.state.sentryIssues = [sentryIssue("101")];
+    const slowSlack: typeof fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.hostname !== "slack.com") return w.impl(input, init);
+      const body = JSON.parse(String(init?.body));
+      w.slack.push({ channel: body.channel, text: body.text, body: "" }); // Slack은 받았다
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      if (init?.signal?.aborted) throw init.signal.reason; // 응답 전에 끊김
+      return new Response(JSON.stringify({ ok: true, ts: "1700000000.000001" }));
+    };
+
+    await runCollect(deps("01:00", { fetchImpl: slowSlack, budgetMs: 40 }));
+    await runCollect(deps("01:05"));
+    expect(w.slack).toHaveLength(1);
+  });
+
+  it("[리뷰 P3-2] 예산이 끝나면 새 Slack 전송은 시작하지 않고 다음 실행에 맡긴다", async () => {
+    w.state.sentryIssues = [sentryIssue("101"), sentryIssue("102")];
+    const result = await runCollect(deps("01:00", { budgetMs: 0 }));
+    expect(w.slack).toHaveLength(0);
+    expect(result.steps.find((s) => s.step === "slack")).toMatchObject({ ok: false, reason: "timeout" });
+    expect(await listPending(db, "site-a", at("01:01"))).toHaveLength(2);
+  });
+
+  it("[리뷰 P3-4] 모든 사이트를 먼저 수집한 뒤 Slack으로 보낸다", async () => {
+    w.state.deployments = [deployment("dpl_1", "ERROR")];
+    await runCollect(deps("01:00", { targets: [TARGET, NO_SENTRY] }));
+    const firstSlack = w.calls.indexOf("slack");
+    const lastCollect = w.calls.findLastIndex((c) => c !== "slack" && c !== "heartbeat");
+    expect(firstSlack).toBeGreaterThan(lastCollect);
+  });
+
+  it("[리뷰 P3-3] 빈 DB에서 두 실행이 겹쳐도 실패하지 않는다", async () => {
+    const fresh = await createTestDb({ migrated: false });
+    try {
+      const results = await Promise.all([
+        runCollect(deps("01:00", { db: fresh.db, holder: "run-a" })),
+        runCollect(deps("01:00", { db: fresh.connect(), holder: "run-b" })),
+      ]);
+      expect(results.map((r) => r.status).sort()).toEqual(["done", "locked"]);
+    } finally {
+      fresh.cleanup();
+    }
+  });
+
+  it("[리뷰 P3-8] id 형식이 다른 incident는 Sentry 해결 확인을 건너뛴다", async () => {
+    const title = maskLogMessage("[articles] 이상한 id");
+    await ingest(
+      db,
+      TARGET,
+      [
+        {
+          target: "site-a",
+          source: "sentry",
+          kind: "issue.new",
+          fingerprint: "sentry:../x",
+          sourceId: "../x",
+          title,
+          tag: null,
+          route: null,
+          count: 1,
+          users: 0,
+          firstSeen: at("00:58").toISOString(),
+          lastSeen: at("00:58").toISOString(),
+          link: "https://sentry.io/issues/x/",
+        },
+      ],
+      at("01:00"),
+    );
+    w.state.sentryStatus = { "..": 404, x: 404 };
+    await runCollect(deps("01:05"));
+    expect(w.calls.filter((c) => c.startsWith("sentry:status"))).toEqual([]);
+    const { rows } = await db.execute("SELECT status FROM incidents WHERE fingerprint = 'sentry:../x'");
+    expect(rows[0].status).toBe("open");
   });
 
   it("Vercel이 실패해도 Sentry는 계속하고 heartbeat는 보내지 않는다", async () => {

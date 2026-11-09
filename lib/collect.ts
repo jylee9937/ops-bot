@@ -26,14 +26,18 @@ export const LOCK_NAME = "collect";
 export const RUN_BUDGET_MS = 90_000;
 /** 실행마다 사이트당 Sentry 해결 여부를 확인할 열린 incident 수. 실행마다 돌아가며 고른다. */
 export const STATUS_CHECK_LIMIT = 10;
+// 열린 incident가 이보다 많으면 넘는 몫은 확인하지 않는다(지금 규모에서는 닿지 않는 값).
 const MAX_OPEN_SCAN = 500;
+const SENTRY_ISSUE_ID = /^\d{1,20}$/;
+const MIGRATION_ATTEMPTS = 3;
 const CRON_INTERVAL_MS = 5 * 60_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 
 export type Step = "vercel" | "sentry" | "sentry-status" | "slack";
 /**
- * 수집 단계는 받은 항목 수와 형식이 달라 건너뛴 수를 함께 남긴다.
- * 건너뛴 항목이 있으면 그 단계는 실패로 본다. 외부 응답 형식이 바뀌어 전부 걸러져도 조용히 지나가지 않게 한다.
+ * 수집 단계는 받아들인 항목 수(`received`, Sentry는 에러 issue만)와 형식이 달라 건너뛴 수를 함께 남긴다.
+ * 건너뛴 항목이 있으면 그 단계는 실패로 보고 커서도 옮기지 않는다. 외부 응답 형식이 바뀌어
+ * 전부 걸러져도 조용히 지나가지 않고, 고칠 때까지 heartbeat가 멈춘다.
  */
 export type StepResult = {
   target: string;
@@ -97,7 +101,9 @@ export function rotate<T>(items: readonly T[], now: Date, limit: number): T[] {
 export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
   const { db, targets, sentry, vercel, slack, heartbeatUrl } = deps;
   const now = (deps.now ?? (() => new Date()))();
-  const signal = AbortSignal.timeout(deps.budgetMs ?? RUN_BUDGET_MS);
+  const budgetMs = deps.budgetMs ?? RUN_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
+  const signal = AbortSignal.timeout(budgetMs);
   const request: RequestOptions = { fetchImpl: deps.fetchImpl, signal };
   const result: CollectResult = {
     status: "done",
@@ -108,7 +114,15 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
   };
 
   // 잠금 표도 마이그레이션이 만든다. 잠금보다 먼저 적용한다.
-  await prepareDb(db);
+  // 처음 실행이 겹치면 한쪽이 '이미 있음'으로 실패한다. 다시 보면 적용된 버전은 건너뛴다.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await prepareDb(db);
+      break;
+    } catch (error) {
+      if (attempt >= MIGRATION_ATTEMPTS) throw error;
+    }
+  }
   const holder = deps.holder ?? crypto.randomUUID();
   if (!(await acquireLock(db, LOCK_NAME, holder, now))) return { ...result, status: "locked" };
 
@@ -140,7 +154,9 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
         const collected = await collectVercel(target.id, target.vercel, vercel, { cursor, now, ...request });
         await recordDeploys(db, collected.deploys, now);
         addSummary(result.ingested, await ingest(db, target, collected.signals, now));
-        if (collected.nextCursor) await saveCursor(db, target.id, "vercel", collected.nextCursor, now);
+        if (collected.nextCursor && collected.skipped === 0) {
+          await saveCursor(db, target.id, "vercel", collected.nextCursor, now);
+        }
         return { received: collected.deploys.length, skipped: collected.skipped };
       });
 
@@ -150,7 +166,9 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
           const cursor = await getCursor(db, target.id, "sentry");
           const collected = await collectSentry(target.id, sentryTarget, sentry, { cursor, now, ...request });
           addSummary(result.ingested, await ingest(db, target, collected.signals, now));
-          if (collected.nextCursor) await saveCursor(db, target.id, "sentry", collected.nextCursor, now);
+          if (collected.nextCursor && collected.skipped === 0) {
+            await saveCursor(db, target.id, "sentry", collected.nextCursor, now);
+          }
           return { received: collected.signals.length, skipped: collected.skipped };
         });
 
@@ -159,7 +177,9 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
         if (collectedOk) {
           await run(target, "sentry-status", async () => {
             const open = await listOpenSentryIncidents(db, target.id, MAX_OPEN_SCAN);
-            for (const incident of rotate(open, now, STATUS_CHECK_LIMIT)) {
+            // 수집기가 만든 id는 숫자다. 다르면 경로가 바뀌어 404로 잘못 닫힐 수 있어 건너뛴다.
+            const checkable = open.filter((incident) => SENTRY_ISSUE_ID.test(incident.evidence.sourceId));
+            for (const incident of rotate(checkable, now, STATUS_CHECK_LIMIT)) {
               const status = await fetchSentryIssueStatus(sentry, incident.evidence.sourceId, request);
               if (status !== "resolved" && status !== "ignored" && status !== "missing") continue;
               if (await resolveIncident(db, target.id, incident.fingerprint, now, incident.episode)) {
@@ -169,14 +189,18 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
           });
         }
       }
+    }
 
+    // 모든 사이트를 수집한 뒤 보낸다. Slack 간격·재시도 대기가 뒤 사이트의 수집 예산을 먹지 않게 한다.
+    // 보내는 중인 전송에는 실행 예산의 끊기 신호를 걸지 않고(자체 10초 제한만), 새 전송 전에만 예산을 본다.
+    for (const target of targets) {
       await run(target, "slack", async () => {
         const delivery = await deliverPending(
           db,
           target,
           now,
-          (message) => postMessage(message, slack.token, request),
-          { ownerUserId: slack.ownerUserId, sleep: deps.sleep },
+          (message) => postMessage(message, slack.token, { fetchImpl: deps.fetchImpl }),
+          { ownerUserId: slack.ownerUserId, sleep: deps.sleep, shouldStop: () => Date.now() >= deadline },
         );
         result.delivered.detailed += delivery.detailed;
         result.delivered.bundled += delivery.bundled;
@@ -191,7 +215,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     const collectedAll = result.steps.filter(({ step }) => step !== "slack").every(({ ok }) => ok);
     if (!heartbeatUrl) {
       result.heartbeat = "disabled";
-    } else if (!collectedAll || (await isDeliveryOverdue(db, now))) {
+    } else if (!collectedAll || (await isDeliveryOverdue(db, now, targets.map(({ id }) => id)))) {
       result.heartbeat = "skipped";
     } else {
       result.heartbeat = await ping(heartbeatUrl, deps.fetchImpl);

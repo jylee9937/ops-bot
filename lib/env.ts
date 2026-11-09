@@ -27,7 +27,7 @@ const optional = (value: string | undefined) => (value === undefined || value ==
 const schema = z.object({
   TURSO_DATABASE_URL: z.string().min(1),
   OPS_TARGETS: z.string().min(1),
-  SENTRY_ORG: z.preprocess(optional, z.string().regex(/^[a-z0-9][a-z0-9-]{0,49}$/).optional()),
+  SENTRY_ORG: z.preprocess(optional, z.string().regex(/^[a-z0-9][a-z0-9_-]{0,49}$/).optional()),
   SENTRY_TOKEN: z.preprocess(optional, z.string().min(1).optional()),
   VERCEL_TEAM_ID: z.string().regex(/^team_[A-Za-z0-9]{1,60}$/),
   VERCEL_TOKEN: z.string().min(1),
@@ -53,6 +53,10 @@ export function loadCollectEnv(env: Record<string, string | undefined>): Collect
     if (!(error instanceof TargetsConfigError)) throw error;
     bad.add("OPS_TARGETS");
   }
+
+  // 로컬 파일(file:)이 아닌 원격 DB는 토큰이 있어야 연결된다.
+  const dbUrl = optional(env.TURSO_DATABASE_URL);
+  if (dbUrl && !dbUrl.startsWith("file:") && !optional(env.TURSO_AUTH_TOKEN)) bad.add("TURSO_AUTH_TOKEN");
 
   // 다른 변수가 틀려도 Sentry 설정이 있는지는 원래 값으로 본다. 형식은 위 스키마가 검사했다.
   if (targets.some((target) => target.sentry)) {

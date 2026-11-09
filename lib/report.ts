@@ -226,7 +226,18 @@ export type DeliveryOptions = {
   ownerUserId?: string;
   // 테스트에서 실제로 기다리지 않게 바꾼다.
   sleep?: (ms: number) => Promise<void>;
+  // 새 전송을 시작하기 전에만 확인한다. 보내는 중인 전송은 끊지 않는다(끊으면 Slack은 받았는데 다음 실행이 또 보낸다).
+  shouldStop?: () => boolean;
 };
+
+/** 실행 예산이 끝나 남은 전송을 다음 실행에 맡겼다. */
+export class DeliveryStopped extends Error {
+  override name = "TimeoutError";
+
+  constructor() {
+    super("실행 예산이 끝나 남은 전송을 멈췄습니다");
+  }
+}
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -264,7 +275,7 @@ export async function deliverPending(
   target: Target,
   now: Date,
   send: Send,
-  { ownerUserId, sleep = wait }: DeliveryOptions = {},
+  { ownerUserId, sleep = wait, shouldStop = () => false }: DeliveryOptions = {},
 ): Promise<DeliveryResult> {
   const result: DeliveryResult = { detailed: 0, bundled: 0, skipped: 0, error: null };
   const { claim, incidents } = await claimPending(db, target.id, now);
@@ -275,6 +286,7 @@ export async function deliverPending(
   // 모두 같은 채널로 간다. 이어 보낼 때 간격을 둔다.
   const paced = async (message: SlackMessage) => {
     if (sentBefore) await sleep(SEND_INTERVAL_MS);
+    if (shouldStop()) throw new DeliveryStopped();
     sentBefore = true;
     return sendWithRetry(send, message, sleep);
   };

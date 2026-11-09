@@ -34,8 +34,10 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json({ error: "config", keys: error.keys }, { status: 500 });
   }
 
-  const db = openDb();
+  let db: ReturnType<typeof openDb> | undefined;
   try {
+    // 연결을 여는 것도 실패할 수 있다(주소 형식 등). 오류 원문은 로그에 남기지 않는다.
+    db = openDb();
     const result = await runCollect({ ...env, db });
     console.info(
       `[collect] ${result.status} · 단계 ${result.steps.filter((s) => s.ok).length}/${result.steps.length} 성공 · heartbeat ${result.heartbeat}`,
@@ -45,6 +47,6 @@ export async function GET(request: Request): Promise<Response> {
     console.error("[collect] 실행 실패", error instanceof Error ? error.name : "unknown");
     return Response.json({ error: "internal" }, { status: 500 });
   } finally {
-    db.close();
+    db?.close();
   }
 }

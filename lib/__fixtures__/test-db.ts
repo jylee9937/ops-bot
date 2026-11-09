@@ -8,16 +8,25 @@ import { createDb, migrate } from "../db";
 export async function createTestDb({ migrated = true }: { migrated?: boolean } = {}): Promise<{
   db: Client;
   url: string;
+  // 같은 파일에 새 연결을 연다(동시 실행 재현용). cleanup이 함께 닫는다.
+  connect: () => Client;
   cleanup: () => void;
 }> {
   const dir = mkdtempSync(join(tmpdir(), "ops-bot-test-"));
   const url = `file:${join(dir, "test.db")}`;
   const db = createDb(url, "");
   if (migrated) await migrate(db);
+  const extra: Client[] = [];
   return {
     db,
     url,
+    connect: () => {
+      const client = createDb(url, "");
+      extra.push(client);
+      return client;
+    },
     cleanup: () => {
+      for (const client of extra) client.close();
       db.close();
       rmSync(dir, { recursive: true, force: true });
     },
