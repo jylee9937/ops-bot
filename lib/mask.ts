@@ -79,16 +79,32 @@ export function maskRoute(raw: string): MaskedText {
   return finish(withoutUrlParts(firstLine(raw)), "/");
 }
 
-/** 스택 프레임에서 파일·함수·줄만 남긴다. 소스 코드와 변수 값은 받지 않는다. */
+// 함수 이름은 코드 식별자 꼴의 앞부분만 받는다. 공백·괄호·콜론 뒤(설명·값)는 버린다.
+const FUNCTION_NAME = /^(?:async |new )?([A-Za-z_$<][\w$.<>[\]]{0,79})/;
+// 파일 경로에 쓰는 글자로 된 앞부분만 받는다. 공백 뒤 설명 같은 꼬리를 버린다.
+const FILE_PATH = /^[\w$./@~+\-[\]()]{1,200}/;
+// 숫자와 영문이 섞인 32자 이상 덩어리(토큰·서명·키로 보이는 값)는 숨긴다.
+const TOKEN_LIKE = /[A-Za-z0-9_\-+=]{32,}/g;
+
+function withoutTokens(text: string): string {
+  return text.replace(TOKEN_LIKE, (run) => (/\d/.test(run) && /[A-Za-z]/.test(run) ? "[숨김]" : run));
+}
+
+/**
+ * 스택 프레임에서 파일·함수·줄만 남긴다. 소스 코드와 변수 값은 받지 않는다.
+ * 프레임은 Claude·DB·Slack으로 가므로 경로·식별자 꼴만 허용하고 토큰처럼 보이는 값은 숨긴다.
+ */
 export function maskFrame(frame: {
   filename?: string | null;
   function?: string | null;
   line?: number | null;
 }): MaskedFrame {
   const { line } = frame;
+  const path = FILE_PATH.exec(withoutUrlParts(firstLine(frame.filename ?? "")).trim())?.[0] ?? "";
+  const fn = frame.function ? (FUNCTION_NAME.exec(firstLine(frame.function).trim())?.[1] ?? "") : "";
   return {
-    filename: finish(withoutUrlParts(firstLine(frame.filename ?? "")), "(파일 없음)"),
-    function: frame.function ? finish(firstLine(frame.function), "(함수 없음)") : null,
+    filename: finish(withoutTokens(path), "(파일 없음)"),
+    function: fn ? finish(withoutTokens(fn), "(함수 없음)") : null,
     line: line != null && Number.isInteger(line) && line > 0 ? line : null,
   };
 }

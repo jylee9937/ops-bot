@@ -977,6 +977,7 @@ describe("incidents", () => {
   describe("Claude 요약 저장·하루 상한", () => {
     const stored = (overrides: Partial<StoredAnalysis> = {}): StoredAnalysis => ({
       key: "1:P2",
+      previousTs: null,
       result: {
         summary: "DB 시간 초과로 목록 조회가 실패합니다.",
         suspectedLayer: "DB",

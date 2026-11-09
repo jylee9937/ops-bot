@@ -17,6 +17,11 @@ const arg = (name: string) => process.argv.find((value) => value.startsWith(`--$
 const model = arg("model") ?? ANALYSIS_MODEL;
 const only = arg("only");
 const scenarios = SCENARIOS.filter((scenario) => !only || scenario.id === only);
+// 이름을 잘못 쓰면 0건을 돌리고 "0/0 통과"로 끝난다. 돌릴 것이 없으면 실패로 끝낸다.
+if (scenarios.length === 0) {
+  console.error(`시나리오가 없습니다: ${only}. 이름: ${SCENARIOS.map(({ id }) => id).join(", ")}`);
+  process.exit(2);
+}
 const client = claudeClient(apiKey);
 
 const results = [];

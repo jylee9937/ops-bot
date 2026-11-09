@@ -58,7 +58,7 @@ function fakeClient(reply: Response | Error | (() => Promise<Response>)) {
     if (typeof reply === "function") return reply();
     return { model: ANALYSIS_MODEL, ...reply };
   });
-  return { client: { beta: { messages: { create } } } as unknown as ClaudeClient, create };
+  return { client: { messages: { create } } as unknown as ClaudeClient, create };
 }
 
 const ok = (body: unknown = VALID): Response => ({
@@ -111,7 +111,7 @@ describe("analysis", () => {
   });
 
   describe("analyzeIncident", () => {
-    it("도구 없이 구조화 출력·낮은 effort·거절 대비·제한 시간으로 부른다", async () => {
+    it("도구·서버 fallback 없이 구조화 출력·낮은 effort·제한 시간으로 부른다", async () => {
       const { client, create } = fakeClient(ok());
       const outcome = await analyzeIncident(client, input());
 
@@ -119,14 +119,15 @@ describe("analysis", () => {
       const [params, options] = create.mock.calls[0] as [Record<string, unknown>, Record<string, unknown>];
       expect(params).toMatchObject({
         model: ANALYSIS_MODEL,
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
         system: SYSTEM_PROMPT,
         output_config: { effort: "low", format: { type: "json_schema" } },
       });
       expect(params).not.toHaveProperty("tools");
       expect(params).not.toHaveProperty("tool_choice");
-      expect(options).toEqual({ timeout: ANALYSIS_TIMEOUT_MS, maxRetries: 0 });
+      // 거절 시 다른 모델로 다시 돌리면 두 번 과금돼 하루 상한이 호출 수와 어긋난다
+      expect(params).not.toHaveProperty("fallbacks");
+      expect(params).not.toHaveProperty("betas");
+      expect(options).toEqual({ timeout: ANALYSIS_TIMEOUT_MS, maxRetries: 0, signal: expect.any(AbortSignal) });
       // 계층·신뢰도는 API가 목록으로 강제한다(설명 글이 아니라 enum)
       expect(params.output_config).toMatchObject({
         format: {
@@ -168,6 +169,21 @@ describe("analysis", () => {
     ] as const)("%s는 던지지 않고 이유로 돌려준다", async (_, error, reason) => {
       const { client } = fakeClient(error);
       expect(await analyzeIncident(client, input())).toEqual({ ok: false, reason });
+    });
+
+    it("헤더를 받은 뒤 본문이 멈춰도 제한 시간에 끊고 시간 초과로 돌려준다", async () => {
+      // SDK의 timeout은 헤더까지만 센다. 본문을 읽다 끊기면 fetch의 AbortError가 올라온다.
+      const create = vi.fn(
+        (_params: unknown, options: { signal: AbortSignal }) =>
+          new Promise((_, reject) => {
+            options.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      );
+      const client = { messages: { create } } as unknown as ClaudeClient;
+
+      const started = Date.now();
+      expect(await analyzeIncident(client, input(), { timeoutMs: 30 })).toEqual({ ok: false, reason: "timeout" });
+      expect(Date.now() - started).toBeLessThan(1_000);
     });
   });
 

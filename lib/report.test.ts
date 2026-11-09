@@ -893,6 +893,27 @@ describe("report", () => {
       expect(JSON.stringify(response)).not.toContain("요약: Claude");
     });
 
+    it("음소거가 끝난 뒤 새로 보내는 알림은 지난 요약을 쓰지 않고 근거를 다시 모은다", async () => {
+      await ingest(db, OTHER, [issue(7, "articles", { target: "site-b", lastSeen: iso("00:57") })], at("01:00"));
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      const { analyzer, inputs } = analyzerOf(OK);
+      const first = recorder();
+      await deliverPending(db, TARGET, at("01:01"), first.send, { ...NO_WAIT, analyzer, sites: [TARGET, OTHER] });
+      expect(inputs[0].otherSitesWithErrors).toEqual(["사이트 B"]);
+
+      await handleAction(db, [TARGET, OTHER], interaction(await byFingerprint("sentry:1"), "mute_1h"), at("01:02"));
+      // 음소거가 끝난 03:00에 다시 발생한다. 이때 사이트 B에는 에러가 없다.
+      await ingest(db, TARGET, [issue(1, "articles", { count: 3, lastSeen: iso("03:00") })], at("03:00"));
+      expect((await byFingerprint("sentry:1")).severity).toBe("P2");
+      const later = recorder();
+      await deliverPending(db, TARGET, at("03:01"), later.send, { ...NO_WAIT, analyzer, sites: [TARGET, OTHER] });
+
+      expect(later.sent).toHaveLength(1);
+      expect(inputs).toHaveLength(2);
+      expect(inputs[1].otherSitesWithErrors).toEqual([]);
+      expect(allText(later.sent[0])).not.toContain("같은 시각 다른 사이트도 에러");
+    });
+
     it("설정에서 빠진 사이트는 이름을 모르니 적지 않는다", async () => {
       await ingest(db, OTHER, [issue(7, "articles", { target: "site-b", lastSeen: iso("00:57") })], at("01:00"));
       await ingest(db, TARGET, [issue(1)], at("01:00"));

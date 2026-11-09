@@ -62,11 +62,13 @@ export type Evidence = {
 };
 
 /**
- * 상세 알림을 보낼 때 모은 보조 정보. `key`(회차:등급)가 지금과 같고 `result`가 있으면 Claude를 다시 부르지 않는다.
- * 글자는 마스킹된 값(frames)·설정의 사이트 id(correlated)·Claude 답(result)이다.
+ * 상세 알림을 보낼 때 모은 보조 정보. `key`(회차:등급)와 `previousTs`가 지금과 같고 `result`가 있으면
+ * Claude를 다시 부르지 않는다(같은 알림을 다시 보낼 때). 글자는 마스킹된 값(frames)·설정의 사이트 id(correlated)·Claude 답(result)이다.
  */
 export type StoredAnalysis = {
   key: string;
+  // 만들 때의 slack_ts. 그 뒤 메시지가 나갔다면(음소거가 끝난 뒤 새 알림 등) 이 요약은 지난 알림의 것이다.
+  previousTs: string | null;
   result: Analysis | null;
   model: string | null;
   frames: MaskedFrame[];

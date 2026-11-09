@@ -13,9 +13,9 @@ export const DAILY_ANALYSIS_LIMIT = 50;
 /** 호출 하나의 제한 시간. 넘으면 기다리지 않고 템플릿으로 보낸다. */
 export const ANALYSIS_TIMEOUT_MS = 20_000;
 // thinking도 max_tokens에 들어간다. 답 자체는 수백 토큰이다.
+// 거절 시 다른 모델로 다시 돌리는 서버 fallback은 쓰지 않는다. 두 시도가 모두 과금돼 하루 상한이 호출 수와 어긋난다.
+// 거절이면 템플릿으로 보낸다.
 const MAX_TOKENS = 4_000;
-// 거절되면 서버가 다른 모델로 한 번 더 돌린다(분류기 오탐 대비). 그래도 거절이면 템플릿.
-const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 
 const SUMMARY_LIMIT = 300;
 const IMPACT_LIMIT = 120;
@@ -168,7 +168,7 @@ export function normalizeAnalysis(raw: unknown): Analysis | null {
   };
 }
 
-export type ClaudeClient = Pick<Anthropic, "beta">;
+export type ClaudeClient = Pick<Anthropic, "messages">;
 
 /** Claude를 한 번 부른다. 상한은 보지 않는다(eval이 그대로 쓴다). 실패는 던지지 않고 이유로 돌려준다. */
 export async function analyzeIncident(
@@ -176,19 +176,19 @@ export async function analyzeIncident(
   input: AnalysisInput,
   { model = ANALYSIS_MODEL, timeoutMs = ANALYSIS_TIMEOUT_MS }: { model?: string; timeoutMs?: number } = {},
 ): Promise<AnalysisOutcome> {
+  // SDK의 timeout은 응답 헤더까지만 센다. 본문을 받는 동안 멈춰도 끊기게 신호를 따로 건다.
+  const signal = AbortSignal.timeout(timeoutMs);
   try {
-    const response = await client.beta.messages.create(
+    const response = await client.messages.create(
       {
         model,
         max_tokens: MAX_TOKENS,
-        betas: [FALLBACK_BETA],
-        fallbacks: "default",
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userPrompt(input) }],
         output_config: { effort: "low", format: { type: "json_schema", schema: OUTPUT_JSON_SCHEMA } },
       },
       // 재시도하면 제한 시간을 넘긴다. 실패하면 템플릿으로 보내고 다음 알림에서 다시 부른다.
-      { timeout: timeoutMs, maxRetries: 0 },
+      { timeout: timeoutMs, maxRetries: 0, signal },
     );
     // 거절이면 내용을 읽지 않는다(비어 있거나 중간에 끊긴 글).
     if (response.stop_reason === "refusal") return { ok: false, reason: "refusal" };
@@ -205,7 +205,8 @@ export async function analyzeIncident(
     const analysis = normalizeAnalysis(json);
     return analysis ? { ok: true, analysis, model: response.model } : { ok: false, reason: "invalid_response" };
   } catch (error) {
-    return { ok: false, reason: failureOf(error) };
+    // 본문을 받다 끊기면 SDK 오류가 아니라 fetch의 AbortError가 올라온다.
+    return { ok: false, reason: signal.aborted ? "timeout" : failureOf(error) };
   }
 }
 

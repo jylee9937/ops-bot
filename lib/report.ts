@@ -377,7 +377,11 @@ async function prepareDetail(
   { analyzer, frames: fetchFrames, sites = [], shouldStop }: DeliveryOptions & { shouldStop: (afterMs?: number) => boolean },
 ): Promise<Prepared> {
   const key = analysisKey(incident);
-  if (incident.analysis?.key === key && incident.analysis.result) return { analyzed: false, failure: null };
+  const stored = incident.analysis;
+  // 같은 알림을 다시 보낼 때만 재사용한다. 그사이 메시지가 나갔으면 새 알림이라 근거(수·동시 장애)를 다시 모은다.
+  if (stored?.key === key && stored.previousTs === incident.slackTs && stored.result) {
+    return { analyzed: false, failure: null };
+  }
 
   const [correlated, frames] = await Promise.all([
     findCorrelatedTargets(db, incident),
@@ -400,7 +404,15 @@ async function prepareDetail(
     }
   }
 
-  await saveAnalysis(db, incident.id, claim, { key, result, model, frames, correlated, at: now.toISOString() });
+  await saveAnalysis(db, incident.id, claim, {
+    key,
+    previousTs: incident.slackTs,
+    result,
+    model,
+    frames,
+    correlated,
+    at: now.toISOString(),
+  });
   return { analyzed: result !== null, failure };
 }
 

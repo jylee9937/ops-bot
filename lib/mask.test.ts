@@ -119,6 +119,31 @@ describe("maskFrame", () => {
   it("파일이 없어도 자리를 채운다", () => {
     expect(maskFrame({}).filename).toBe("(파일 없음)");
   });
+
+  it("함수 이름은 식별자 꼴의 앞부분만 남기고 설명·값 꼬리는 버린다", () => {
+    expect(maskFrame({ filename: "a.ts", function: "handler (Authorization: Bearer EXAMPLE_SECRET_AZBYCX)" }).function).toBe(
+      "handler",
+    );
+    expect(maskFrame({ filename: "a.ts", function: "async loadArticles" }).function).toBe("loadArticles");
+    expect(maskFrame({ filename: "a.ts", function: "Object.<anonymous>" }).function).toBe("Object.<anonymous>");
+    expect(maskFrame({ filename: "a.ts", function: "?" }).function).toBeNull();
+  });
+
+  it("토큰처럼 보이는 값은 경로·함수 이름에서 숨긴다", () => {
+    const token = "eyJhbGciOiJIUzI1NiJ9abcdef0123456789xyz";
+    expect(maskFrame({ filename: `https://cdn.example.com/static/${token}/app.js?sig=1` }).filename).toBe(
+      "/static/[숨김]/app.js",
+    );
+    expect(maskFrame({ filename: "a.ts", function: `sk_live_${"a1".repeat(16)}` }).function).toBe("[숨김]");
+    expect(maskFrame({ filename: "src/app/page.tsx Authorization: Bearer x" }).filename).toBe("src/app/page.tsx");
+    // 숫자 없는 긴 이름과 짧은 해시는 그대로 둔다
+    expect(maskFrame({ filename: "a.ts", function: "handleSubmitRegistrationFormWithValidation" }).function).toBe(
+      "handleSubmitRegistrationFormWithValidation",
+    );
+    expect(maskFrame({ filename: "/_next/static/chunks/page-3f2a1b9c8d7e6f50.js" }).filename).toBe(
+      "/_next/static/chunks/page-3f2a1b9c8d7e6f50.js",
+    );
+  });
 });
 
 describe("tagOf", () => {

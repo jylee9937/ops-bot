@@ -112,7 +112,8 @@ export function rotate<T>(items: readonly T[], now: Date, limit: number): T[] {
  */
 export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
   const { db, targets, sentry, vercel, slack, heartbeatUrl } = deps;
-  const now = (deps.now ?? (() => new Date()))();
+  const clock = deps.now ?? (() => new Date());
+  const now = clock();
   const budgetMs = deps.budgetMs ?? RUN_BUDGET_MS;
   const deadline = Date.now() + budgetMs;
   const signal = AbortSignal.timeout(budgetMs);
@@ -208,7 +209,8 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     const analyzer = apiKey
       ? createAnalyzer({
           client: deps.claude ?? claudeClient(apiKey),
-          reserveDaily: () => reserveAnalysisCall(db, now, DAILY_ANALYSIS_LIMIT),
+          // 실행 시작 시각이 아니라 부르는 순간의 날짜로 센다. 자정을 넘긴 실행이 전날 칸을 쓰지 않게.
+          reserveDaily: () => reserveAnalysisCall(db, clock(), DAILY_ANALYSIS_LIMIT),
         })
       : undefined;
 

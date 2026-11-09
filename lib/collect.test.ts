@@ -473,12 +473,10 @@ describe("runCollect", () => {
     function claude(reply: () => unknown) {
       const requests: { system: string; messages: { content: string }[] }[] = [];
       const client = {
-        beta: {
-          messages: {
-            create: async (params: (typeof requests)[number]) => {
-              requests.push(params);
-              return reply();
-            },
+        messages: {
+          create: async (params: (typeof requests)[number]) => {
+            requests.push(params);
+            return reply();
           },
         },
       } as unknown as ClaudeClient;
@@ -548,6 +546,25 @@ describe("runCollect", () => {
       expect(result.steps.every(({ ok }) => ok)).toBe(true);
       expect(w.slack[0].body).toContain("요약 없음 · API 키 확인 필요");
       expect(result.heartbeat).toBe("sent");
+    });
+
+    it("자정을 넘겨 부르면 실행 시작일이 아니라 새 날짜의 하루 상한으로 센다", async () => {
+      // KST 11/9 23시에 그날 칸을 다 썼다
+      for (let i = 0; i < DAILY_ANALYSIS_LIMIT; i++) await reserveAnalysisCall(db, at("14:00"), DAILY_ANALYSIS_LIMIT);
+      w.state.sentryIssues = [sentryIssue("101", { firstSeen: "2026-11-09T14:58:00Z", lastSeen: "2026-11-09T14:58:00Z" })];
+      const { client, requests } = claude(answered);
+      // 실행은 KST 23:59에 시작하고, Claude를 부를 때는 자정을 넘겼다
+      let calls = 0;
+      const now = () => (calls++ === 0 ? at("14:59") : at("15:01"));
+
+      const result = await runCollect(deps("14:59", { anthropicApiKey: "test-key", claude: client, now }));
+      expect(requests).toHaveLength(1);
+      expect(result.delivered).toMatchObject({ detailed: 1, analyzed: 1 });
+      const { rows } = await db.execute("SELECT day, calls FROM analysis_usage ORDER BY day");
+      expect(rows.map((row) => [row.day, row.calls])).toEqual([
+        ["2026-11-09", DAILY_ANALYSIS_LIMIT],
+        ["2026-11-10", 1],
+      ]);
     });
 
     it("키가 없으면 Claude를 부르지 않는다", async () => {
