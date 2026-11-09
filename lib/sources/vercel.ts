@@ -55,6 +55,38 @@ const pageSchema = z.object({
   pagination: z.object({ next: nonNegativeInt.nullish() }),
 });
 
+/**
+ * 배포 실패 신호. 폴링과 webhook이 같은 배포를 받아도 incident 하나가 되도록 지문·제목을 한곳에서 만든다.
+ * 오류 코드는 폴링 응답에만 있다(webhook 본문에는 없음).
+ */
+export function deployFailedSignal(
+  targetId: string,
+  deploy: {
+    deploymentId: string;
+    errorCode?: string | null;
+    link: string | null;
+    firstSeen: string;
+    lastSeen: string;
+  },
+): Signal {
+  const code = deploy.errorCode && ERROR_CODE.test(deploy.errorCode) ? ` (${deploy.errorCode})` : "";
+  return {
+    target: targetId,
+    source: "vercel",
+    kind: "deploy.failed",
+    fingerprint: `vercel:${deploy.deploymentId}:ERROR`,
+    sourceId: deploy.deploymentId,
+    title: maskLogMessage(`배포 실패${code}`),
+    tag: null,
+    route: null,
+    count: 1,
+    users: 0,
+    firstSeen: deploy.firstSeen,
+    lastSeen: deploy.lastSeen,
+    link: deploy.link ?? FALLBACK_LINK,
+  };
+}
+
 /** 커서 이후 production 배포를 읽는다. 타임라인은 모든 상태를, 알림은 ERROR만 쓴다. */
 export async function collectVercel(
   targetId: string,
@@ -107,22 +139,15 @@ export async function collectVercel(
       });
 
       if (state === "ERROR") {
-        const code = errorCode && ERROR_CODE.test(errorCode) ? ` (${errorCode})` : "";
-        signals.push({
-          target: targetId,
-          source: "vercel",
-          kind: "deploy.failed",
-          fingerprint: `vercel:${deploymentId}:ERROR`,
-          sourceId: deploymentId,
-          title: maskLogMessage(`배포 실패${code}`),
-          tag: null,
-          route: null,
-          count: 1,
-          users: 0,
-          firstSeen: createdAt,
-          lastSeen: new Date(ready ?? created).toISOString(),
-          link: inspectorUrl ?? FALLBACK_LINK,
-        });
+        signals.push(
+          deployFailedSignal(targetId, {
+            deploymentId,
+            errorCode,
+            link: inspectorUrl ?? null,
+            firstSeen: createdAt,
+            lastSeen: new Date(ready ?? created).toISOString(),
+          }),
+        );
       }
     }
 

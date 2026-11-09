@@ -497,6 +497,24 @@ describe("incidents", () => {
     });
   });
 
+  describe("배포 실패 재개방", () => {
+    it("해결한 배포 실패는 더 늦은 발생 시각이 와도 다시 열지 않는다(같은 배포는 두 번 실패하지 않음)", async () => {
+      await ingest(db, TARGET, [deployFailed({ lastSeen: iso("01:04") })], at("01:00"));
+      await resolveIncident(db, TARGET.id, "vercel:dpl_1:ERROR", at("01:01"));
+      const summary = await ingest(db, TARGET, [deployFailed({ lastSeen: iso("01:04") })], at("01:02"));
+
+      expect(summary.reopened).toBe(0);
+      expect(await row("vercel:dpl_1:ERROR")).toMatchObject({ status: "resolved", episode: 1 });
+    });
+
+    it("Sentry issue는 해결 뒤 새로 발생하면 그대로 다시 연다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await resolveIncident(db, TARGET.id, "sentry:1", at("01:01"));
+      const summary = await ingest(db, TARGET, [issue({ count: 2, lastSeen: iso("01:05") })], at("01:05"));
+      expect(summary.reopened).toBe(1);
+    });
+  });
+
   describe("교차 사이트", () => {
     it("5분 안에 다른 사이트에도 에러가 있으면 알려 준다", async () => {
       await ingest(db, TARGET, [issue({ lastSeen: iso("01:00") })], at("01:01"));

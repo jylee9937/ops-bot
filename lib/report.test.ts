@@ -523,6 +523,28 @@ describe("report", () => {
       expect(waits.filter((ms) => ms >= 1_000 && ms !== 1_000)).toHaveLength(5);
     });
 
+    it("[PR4 리뷰 2] 다시 보낼 대기 시간이 남은 예산을 넘으면 기다리지 않고 멈춘다", async () => {
+      await ingest(db, TARGET, [issue(1)], at("01:00"));
+      let calls = 0;
+      const waits: number[] = [];
+      const send: Send = async () => {
+        calls++;
+        throw new SlackError("rate_limit", "ratelimited", 5_000);
+      };
+      const deadline = Date.now() + 2_000;
+      const result = await deliverPending(db, TARGET, at("01:01"), send, {
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+        shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline,
+      });
+
+      expect(calls).toBe(1);
+      expect(waits).toEqual([]);
+      expect(result.error).toBeInstanceOf(SlackError);
+      expect(await listPending(db, TARGET.id, at("01:01"))).toHaveLength(1);
+    });
+
     it("[리뷰 5] 기다릴 시간이 너무 길면 멈추고 다음 실행에 맡긴다", async () => {
       await ingest(db, TARGET, [issue(1), issue(2)], at("01:00"));
       let calls = 0;

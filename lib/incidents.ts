@@ -288,6 +288,9 @@ function planSignal(
 
   // 해결 전에 일어난 일을 겹쳐 읽었을 뿐이다.
   if (row?.status === "resolved" && signal.lastSeen <= (row.resolvedAt ?? "")) return skip();
+  // 같은 배포는 두 번 실패하지 않는다. 해결한 배포 실패는 시각과 상관없이 다시 열지 않는다.
+  // webhook 서명에는 시각이 없어, 미래 시각(허용 오차 안) 이벤트를 다시 보내면 위 규칙을 지나칠 수 있다.
+  if (row?.status === "resolved" && signal.kind === "deploy.failed") return skip();
 
   const isMuted = until !== undefined && signal.lastSeen <= until;
   const { area, severity: base } = classify(target, signal);
