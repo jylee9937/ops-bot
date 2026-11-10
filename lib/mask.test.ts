@@ -81,6 +81,18 @@ describe("maskRoute", () => {
     ["주소만", "https://site.example", "/"],
     ["경로 속 이메일", "/users/kim@example.com/edit", "/users/[이메일]/edit"],
     ["소스 위치", "app/api/playback/route.ts in GET", "app/api/playback/route.ts in GET"],
+    ["함수(파일)", "listArticles(src/entities/article/api/queries.ts)", "listArticles(src/entities/article/api/queries.ts)"],
+    ["동적 경로", "GET /lectures/[id]", "GET /lectures/[id]"],
+    ["한글 경로", "/columns/셀교회", "/columns/셀교회"],
+    [
+      "함수 뒤에 붙은 위조 글",
+      "listArticles (Authorization: Bearer fake-e2e-not-a-secret)(src/entities/article/api/queries.ts)",
+      "listArticles",
+    ],
+    ["경로 뒤 설명", "GET /api/playback token abc", "GET /api/playback"],
+    ["in 함수 뒤 설명", "app/api/x/route.ts in GET (secret value)", "app/api/x/route.ts in GET"],
+    ["경로 속 토큰", "/auth/confirm/eyJhbGciOiJIUzI1NiJ9x1y2z3a4b5c6d7e8f9", "/auth/confirm/[숨김]"],
+    ["허용하지 않는 글자로 시작", "Authorization: Bearer abc", "Authorization"],
   ])("%s", (_name, raw, expected) => {
     expect(maskRoute(raw)).toBe(expected);
   });

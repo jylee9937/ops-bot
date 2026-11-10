@@ -74,11 +74,6 @@ export function maskException(type: string, value?: string | null): MaskedText {
   return finish(TAG.test(message) ? `${message} (${name})` : name, name);
 }
 
-/** route에서 사이트 주소와 쿼리·해시를 뗀다. */
-export function maskRoute(raw: string): MaskedText {
-  return finish(withoutUrlParts(firstLine(raw)), "/");
-}
-
 // 함수 이름은 코드 식별자 꼴의 앞부분만 받는다. 공백·괄호·콜론 뒤(설명·값)는 버린다.
 const FUNCTION_NAME = /^(?:async |new )?([A-Za-z_$<][\w$.<>[\]]{0,79})/;
 // 파일 경로에 쓰는 글자로 된 앞부분만 받는다. 공백 뒤 설명 같은 꼬리를 버린다.
@@ -88,6 +83,25 @@ const TOKEN_LIKE = /[A-Za-z0-9_\-+=]{32,}/g;
 
 function withoutTokens(text: string): string {
   return text.replace(TOKEN_LIKE, (run) => (/\d/.test(run) && /[A-Za-z]/.test(run) ? "[숨김]" : run));
+}
+
+const HTTP_METHOD = /^(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) (?=\/)/;
+// 경로·파일·`함수(파일)`에 쓰는 글자. 공백이 없으니 뒤에 붙은 설명·값은 여기서 끊긴다.
+const ROUTE_PATH = /^[\p{L}\p{N}_$./@~+\-[\]()%]{1,200}/u;
+
+/**
+ * Sentry culprit에서 사이트 주소와 쿼리·해시를 떼고, culprit이 실제로 쓰는 꼴만 남긴다:
+ * `METHOD /경로`, `/경로`, `함수(파일)`, `파일 in 함수`. 그 뒤의 꼬리는 버린다.
+ * culprit은 Slack과 Claude로 가는데 위조된 이벤트는 여기에 아무 글이나 넣을 수 있다.
+ */
+export function maskRoute(raw: string): MaskedText {
+  const text = withoutUrlParts(firstLine(raw)).trim();
+  const method = HTTP_METHOD.exec(text)?.[0] ?? "";
+  const rest = text.slice(method.length);
+  const path = ROUTE_PATH.exec(rest)?.[0] ?? "";
+  const after = rest.slice(path.length);
+  const fn = path && after.startsWith(" in ") ? FUNCTION_NAME.exec(after.slice(4))?.[1] : undefined;
+  return finish(withoutTokens(`${method}${path}${fn ? ` in ${fn}` : ""}`), "/");
 }
 
 /**
