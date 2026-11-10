@@ -37,6 +37,8 @@ export function classify(target: Target, signal: Signal): Classification {
         (route !== null && matchesRoute(route, pattern)),
     ),
   );
+  // 외부 감시가 다운이면 사이트(또는 그 영역)가 안 열린다는 뜻이라 영역과 상관없이 P1이다.
+  if (signal.kind === "uptime.down") return { area: area?.name ?? DEPLOY_AREA.area, severity: "P1" };
   return area ? { area: area.name, severity: area.severity } : UNMATCHED_AREA;
 }
 

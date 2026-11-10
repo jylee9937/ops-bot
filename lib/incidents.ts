@@ -35,6 +35,13 @@ const SLACK_REQUEST_RETENTION_MS = 60 * 60_000;
 const FINAL_DEPLOY_STATES = "'READY', 'ERROR', 'CANCELED', 'DELETED'";
 // 알림을 다시 보내야 하거나 보낼 필요가 없어지면 진행 중인 전송의 표를 무효로 만든다.
 const CLEAR_CLAIM = "notify_claimed_at = NULL, notify_claim = NULL";
+// 외부 감시의 다운 시작 시각을 같은 다운으로 볼 차이. 시작 시각을 상태 지속 시간으로 거꾸로 계산하면
+// 호출마다 1초쯤 흔들린다. 실제로 새로 다운되려면 확인 간격(무료 5분)이 한 번은 지나야 한다.
+const SAME_DOWN_MS = 60_000;
+
+function isSameDown(a: string, b: string): boolean {
+  return Math.abs(Date.parse(a) - Date.parse(b)) < SAME_DOWN_MS;
+}
 
 /** route가 쓰는 연결. 표는 계속 이 파일의 함수로만 읽고 쓴다. */
 export function openDb(): Client {
@@ -321,8 +328,14 @@ function planSignal(
     };
   }
 
+  // 외부 감시는 다운 시작 시각이 회차다. 해결 시각이 아니라 저장된 시작 시각과 비교한다.
+  // 같은 다운이면(열려 있든 해결 버튼으로 닫았든) 그대로 둔다. 다르면 수집 사이에 회복했다가 다시 다운된 것이라
+  // 열려 있어도 새 회차로 다시 알린다. 옛 메시지의 해결 버튼을 새 다운이 시작된 뒤에 눌러도 새 다운을 놓치지 않는다.
+  const isNewDown = signal.kind === "uptime.down" && row !== undefined;
+  if (isNewDown && row !== undefined && isSameDown(signal.lastSeen, row.lastSeen)) return skip();
+
   // 해결 전에 일어난 일을 겹쳐 읽었을 뿐이다.
-  if (row?.status === "resolved" && signal.lastSeen <= (row.resolvedAt ?? "")) return skip();
+  if (!isNewDown && row?.status === "resolved" && signal.lastSeen <= (row.resolvedAt ?? "")) return skip();
   // 같은 배포는 두 번 실패하지 않는다. 해결한 배포 실패는 시각과 상관없이 다시 열지 않는다.
   // webhook 서명에는 시각이 없어, 미래 시각(허용 오차 안) 이벤트를 다시 보내면 위 규칙을 지나칠 수 있다.
   if (row?.status === "resolved" && signal.kind === "deploy.failed") return skip();
@@ -364,7 +377,7 @@ function planSignal(
     };
   }
 
-  if (row.status === "resolved") {
+  if (row.status === "resolved" || isNewDown) {
     const { snapshots, increase } = updateSnapshots(
       baselineSnapshots(row.evidence.count, now),
       signal.count,
@@ -499,19 +512,37 @@ export async function listPending(db: Client, targetId: string, now: Date): Prom
   return rows.map(toIncident);
 }
 
+async function listOpenByPrefix(
+  db: Client,
+  targetId: string,
+  prefix: "sentry:" | "uptime:",
+  limit: number,
+): Promise<Incident[]> {
+  const { rows } = await db.execute({
+    sql: `SELECT * FROM incidents
+          WHERE target = ? AND status = 'open' AND fingerprint LIKE ?
+          ORDER BY last_seen LIMIT ?`,
+    args: [targetId, `${prefix}%`, limit],
+  });
+  return rows.map(toIncident);
+}
+
 /** Sentry에서 해결됐는지 따로 확인할 열린 incident. 오래 조용했던 것부터 돌려준다. */
 export async function listOpenSentryIncidents(
   db: Client,
   targetId: string,
   limit: number,
 ): Promise<Incident[]> {
-  const { rows } = await db.execute({
-    sql: `SELECT * FROM incidents
-          WHERE target = ? AND status = 'open' AND fingerprint LIKE 'sentry:%'
-          ORDER BY last_seen LIMIT ?`,
-    args: [targetId, limit],
-  });
-  return rows.map(toIncident);
+  return listOpenByPrefix(db, targetId, "sentry:", limit);
+}
+
+/** 감시 상태로 해결 여부를 확인할 열린 외부 감시 incident. */
+export async function listOpenUptimeIncidents(
+  db: Client,
+  targetId: string,
+  limit: number,
+): Promise<Incident[]> {
+  return listOpenByPrefix(db, targetId, "uptime:", limit);
 }
 
 const SEVERITY_RANK: Record<Severity, number> = { P1: 0, P2: 1, P3: 2 };

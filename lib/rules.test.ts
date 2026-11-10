@@ -45,6 +45,22 @@ function signal(tagText: string | null, route: string | null, kind: Signal["kind
   };
 }
 
+describe("classify 외부 감시", () => {
+  it("경로가 맞는 영역 이름을 쓰되 등급은 영역과 상관없이 P1이다", () => {
+    expect(classify(TARGET, signal(null, "https://site.example/articles/1", "uptime.down"))).toEqual({
+      area: "공개 조회",
+      severity: "P1",
+    });
+  });
+
+  it("맞는 영역이 없으면 전체·P1이다", () => {
+    expect(classify(TARGET, signal(null, "https://site.example/api/health", "uptime.down"))).toEqual({
+      area: "전체",
+      severity: "P1",
+    });
+  });
+});
+
 describe("classify", () => {
   it.each([
     ["태그 일치", "auth", null, "인증", "P1"],
