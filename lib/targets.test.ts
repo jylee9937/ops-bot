@@ -21,6 +21,23 @@ describe("parseTargets", () => {
     expect(target.areas[0].severity).toBe("P1");
   });
 
+  it("외부 감시 호스트를 읽는다(선택)", () => {
+    const [withHosts, without] = parseTargets(
+      JSON.stringify([{ ...site, uptime: { hosts: ["www.site-a.example"] } }, { ...site, id: "site-b" }]),
+    );
+    expect(withHosts.uptime).toEqual({ hosts: ["www.site-a.example"] });
+    expect(without.uptime).toBeUndefined();
+  });
+
+  it.each([
+    ["빈 목록", []],
+    ["대문자", ["WWW.SITE-A.EXAMPLE"]],
+    ["주소 전체", ["https://site-a.example/"]],
+    ["점 없는 이름", ["localhost"]],
+  ])("외부 감시 호스트를 거부한다: %s", (_label, hosts) => {
+    expect(() => parseTargets(JSON.stringify([{ ...site, uptime: { hosts } }]))).toThrow(TargetsConfigError);
+  });
+
   it("Sentry가 없는 사이트를 허용한다", () => {
     const withoutSentry = { ...site, id: "site-b", sentry: undefined };
 

@@ -1,6 +1,6 @@
 import type { MaskedText } from "./mask";
 
-export type SignalSource = "sentry" | "vercel";
+export type SignalSource = "sentry" | "vercel" | "uptimerobot";
 
 export type SignalKind =
   | "issue.new"
@@ -8,7 +8,9 @@ export type SignalKind =
   | "issue.ongoing"
   | "issue.resolved"
   | "issue.ignored"
-  | "deploy.failed";
+  | "deploy.failed"
+  // 외부 감시(UptimeRobot)가 다운으로 본 감시. 다시 UP이 되면 collect가 해결 처리한다.
+  | "uptime.down";
 
 /** 수집기가 외부 응답을 정규화한 결과. 글자는 모두 입구에서 마스킹됐다. */
 export type Signal = {

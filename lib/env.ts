@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { isSlackUserId } from "./slack";
 import type { SentryConfig } from "./sources/sentry";
+import type { UptimeRobotConfig } from "./sources/uptimerobot";
 import type { VercelConfig } from "./sources/vercel";
 import { parseTargets, TargetsConfigError, type Target } from "./targets";
 
@@ -13,6 +14,8 @@ export type CollectEnv = {
   heartbeatUrl: string | null;
   // 없으면 Claude 요약 없이 템플릿으로만 알린다.
   anthropicApiKey: string | null;
+  // 없으면 외부 감시 단계를 건너뛴다. 이전 설정으로 만든 deps에는 칸이 없을 수 있다.
+  uptimeRobot?: UptimeRobotConfig | null;
 };
 
 /** 설정 오류. 문제가 있는 변수 이름만 담는다. 값은 담지 않는다. */
@@ -38,6 +41,8 @@ const schema = z.object({
   HEARTBEAT_URL: z.preprocess(optional, z.url({ protocol: /^https$/ }).optional()),
   // 형식은 검사하지 않는다. 잘못된 키는 수집을 막지 않고, 알림에 'API 키 확인 필요'로 드러난다.
   ANTHROPIC_API_KEY: z.preprocess(optional, z.string().min(1).optional()),
+  // UptimeRobot Read-only 키. 읽기만 하므로 감시를 바꾸거나 지울 수 없다.
+  UPTIMEROBOT_API_KEY: z.preprocess(optional, z.string().regex(/^[A-Za-z0-9_-]{8,200}$/).optional()),
 });
 
 /**
@@ -77,5 +82,6 @@ export function loadCollectEnv(env: Record<string, string | undefined>): Collect
     slack: { token: data.SLACK_BOT_TOKEN, ownerUserId: data.SLACK_OWNER_USER_ID },
     heartbeatUrl: data.HEARTBEAT_URL ?? null,
     anthropicApiKey: data.ANTHROPIC_API_KEY ?? null,
+    uptimeRobot: data.UPTIMEROBOT_API_KEY ? { apiKey: data.UPTIMEROBOT_API_KEY } : null,
   };
 }

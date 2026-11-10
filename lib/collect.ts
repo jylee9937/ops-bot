@@ -13,6 +13,7 @@ import {
   ingest,
   isDeliveryOverdue,
   listOpenSentryIncidents,
+  listOpenUptimeIncidents,
   prepareDb,
   purgeExpired,
   recordDeploys,
@@ -29,6 +30,13 @@ import { deliverPending } from "./report";
 import { postMessage, SlackError } from "./slack";
 import { collectSentry, fetchSentryFrames, fetchSentryIssueStatus } from "./sources/sentry";
 import { SourceError, type RequestOptions } from "./sources/shared";
+import {
+  fetchUptimeMonitors,
+  isRecovered,
+  monitorsFor,
+  uptimeSignals,
+  type UptimeList,
+} from "./sources/uptimerobot";
 import { collectVercel } from "./sources/vercel";
 import type { Target } from "./targets";
 
@@ -47,7 +55,7 @@ const FRAMES_TIMEOUT_MS = 5_000;
 // 실행 기록은 보조 정보다. 늦으면 기다리지 않고 결과를 돌려준다(route 제한 시간 안에 끝나게).
 const RECORD_TIMEOUT_MS = 5_000;
 
-export type Step = "vercel" | "sentry" | "sentry-status" | "slack";
+export type Step = "vercel" | "sentry" | "sentry-status" | "uptime" | "slack";
 /**
  * 수집 단계는 받아들인 항목 수(`received`, Sentry는 에러 issue만)와 형식이 달라 건너뛴 수를 함께 남긴다.
  * 건너뛴 항목이 있으면 그 단계는 실패로 보고 커서도 옮기지 않는다. 외부 응답 형식이 바뀌어
@@ -193,6 +201,17 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
 
   let finished = false;
   try {
+    // 외부 감시 목록은 계정 하나에서 오므로 실행당 한 번만 읽고 사이트별로 나눈다(무료 한도 분당 10회).
+    // 실패는 던지지 않고 담아 두었다가, 감시를 쓰는 사이트마다 그 단계의 실패로 남긴다.
+    const uptimeRobot = deps.uptimeRobot ?? null;
+    const uptimeList: Promise<{ ok: true; list: UptimeList } | { ok: false; error: unknown }> | null =
+      uptimeRobot && targets.some((target) => target.uptime)
+        ? fetchUptimeMonitors(uptimeRobot, { now, ...request }).then(
+            (list) => ({ ok: true as const, list }),
+            (error: unknown) => ({ ok: false as const, error }),
+          )
+        : null;
+
     for (const target of targets) {
       // 배포를 먼저 기록해야 Sentry incident의 '배포 직후'를 판단할 수 있다.
       await run(target, "vercel", async () => {
@@ -234,6 +253,29 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
             }
           });
         }
+      }
+
+      if (target.uptime && uptimeList) {
+        const { hosts } = target.uptime;
+        await run(target, "uptime", async () => {
+          const fetched = await uptimeList;
+          if (!fetched.ok) throw fetched.error;
+          const { list } = fetched;
+          const mine = monitorsFor(hosts, list.monitors);
+          addSummary(result.ingested, await ingest(db, target, uptimeSignals(target.id, mine), now));
+
+          // 다시 UP이 됐거나 멈췄거나 목록에서 사라진 감시의 열린 incident를 닫는다.
+          const byId = new Map(mine.map((monitor) => [String(monitor.id), monitor]));
+          for (const incident of await listOpenUptimeIncidents(db, target.id, MAX_OPEN_SCAN)) {
+            if (!isRecovered(byId.get(incident.evidence.sourceId), list)) continue;
+            if (await resolveIncident(db, target.id, incident.fingerprint, now, incident.episode)) {
+              result.ingested.resolved++;
+            }
+          }
+          // 읽은 만큼은 처리했다. 남은 쪽의 감시를 놓치고 있으니 단계를 실패로 남겨 heartbeat에 드러낸다.
+          if (!list.complete) throw new SourceError("uptimerobot", "incomplete");
+          return { received: mine.length, skipped: list.skipped };
+        });
       }
     }
 

@@ -51,7 +51,18 @@ describe("loadCollectEnv", () => {
       slack: { token: "xoxb-slack-secret-value", ownerUserId: "U0OWNER1" },
       heartbeatUrl: "https://hc-ping.example/abc",
       anthropicApiKey: "anthropic-secret-value",
+      uptimeRobot: null,
     });
+  });
+
+  it("UptimeRobot 키는 선택이다. 있으면 묶고, 형식이 다르면 이름만 알린다", () => {
+    expect(loadCollectEnv(env({ UPTIMEROBOT_API_KEY: "ur1234567-abcdef0123456789abcdef" })).uptimeRobot).toEqual({
+      apiKey: "ur1234567-abcdef0123456789abcdef",
+    });
+    expect(loadCollectEnv(env({ UPTIMEROBOT_API_KEY: "" })).uptimeRobot).toBeNull();
+    expect(keysOf(() => loadCollectEnv(env({ UPTIMEROBOT_API_KEY: "bad key with spaces" })))).toEqual([
+      "UPTIMEROBOT_API_KEY",
+    ]);
   });
 
   it("Claude 키는 선택이다. 없으면 null이고 다른 설정은 그대로 쓴다", () => {

@@ -121,8 +121,19 @@ function reason(incident: Incident): string {
   // 이번 회차에 이미 보낸 적이 있다: 등급이 올랐거나 음소거가 끝난 뒤 새로 발생했다.
   if (incident.slackTs !== null) return "다시 알림";
   if (incident.episode > 1) return `재발 (${incident.episode}회차)`;
-  return "새 에러";
+  return incident.evidence.kind === "uptime.down" ? "외부 감시 다운" : "새 에러";
 }
+
+/** Claude 요약을 붙일 알림인지. 배포 실패와 외부 감시 다운은 요약할 오류 문구가 없다. */
+function isSummarizable(incident: Incident): boolean {
+  return incident.evidence.kind !== "deploy.failed" && incident.evidence.kind !== "uptime.down";
+}
+
+const LINK_LABELS: Record<Incident["evidence"]["source"], string> = {
+  sentry: "Sentry에서 보기",
+  vercel: "Vercel에서 보기",
+  uptimerobot: "UptimeRobot에서 보기",
+};
 
 /** 이 회차·등급에서 만든 보조 정보만 쓴다. 그 뒤 등급이 오르거나 다시 열리면 새로 만든다. */
 export function analysisKey(incident: Pick<Incident, "episode" | "severity">): string {
@@ -168,7 +179,13 @@ function details(incident: Incident, withReason: boolean, sites: readonly Target
   if (evidence.source === "sentry") {
     lines.push(`누적 ${evidence.count}회 · 영향 사용자 ${evidence.users}명`);
   }
-  lines.push(`처음 ${kst(incident.firstSeen)} · 마지막 ${kst(incident.lastSeen)} (KST)`);
+  // 외부 감시는 이번 다운이 시작된 시각만 의미가 있다. 신호의 lastSeen이 그 시각이다.
+  // firstSeen은 다시 열려도 첫 회차 값으로 남으므로 쓰지 않는다.
+  lines.push(
+    evidence.kind === "uptime.down"
+      ? `다운 시작 ${kst(incident.lastSeen)} (KST)`
+      : `처음 ${kst(incident.firstSeen)} · 마지막 ${kst(incident.lastSeen)} (KST)`,
+  );
   if (evidence.route) lines.push(`경로 ${escapeSlack(evidence.route)}`);
   const extra = currentAnalysis(incident);
   // 호출 지점(가장 안쪽 프레임)만 적는다. 나머지는 Sentry에서 본다.
@@ -191,7 +208,7 @@ function buttons(incident: Incident): ButtonElement[] {
         {
           type: "button",
           action_id: LINK_ACTION_ID,
-          text: plainText(incident.evidence.source === "vercel" ? "Vercel에서 보기" : "Sentry에서 보기"),
+          text: plainText(LINK_LABELS[incident.evidence.source] ?? LINK_LABELS.sentry),
           url: link,
         },
       ]
@@ -395,7 +412,7 @@ async function prepareDetail(
   let result: Analysis | null = null;
   let model: string | null = null;
   let failure: AnalysisFailure | null = null;
-  if (analyzer && incident.evidence.kind !== "deploy.failed") {
+  if (analyzer && isSummarizable(incident)) {
     if (shouldStop(ANALYSIS_TIMEOUT_MS + ANALYSIS_SEND_RESERVE_MS)) {
       failure = "no_time";
     } else {

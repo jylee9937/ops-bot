@@ -21,6 +21,14 @@ const targetSchema = z.object({
       environment: z.string().min(1).default("production"),
     })
     .optional(),
+  // 외부 감시(UptimeRobot)에서 이 사이트 것으로 볼 호스트. 감시 URL의 호스트가 정확히 같아야 한다.
+  uptime: z
+    .object({
+      hosts: z
+        .array(z.string().regex(/^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/))
+        .min(1),
+    })
+    .optional(),
   slackChannel: z.string().regex(/^#[^\s]+$/),
   areas: z.array(areaSchema).default([]),
 });

@@ -136,6 +136,7 @@ const STEP_NAMES: Record<StepResult["step"], string> = {
   vercel: "Vercel",
   sentry: "Sentry",
   "sentry-status": "Sentry 해결 확인",
+  uptime: "외부 감시",
   slack: "Slack 전송",
 };
 

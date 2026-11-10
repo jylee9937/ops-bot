@@ -79,8 +79,10 @@ function world() {
     sentryIssues: [] as unknown[],
     sentryStatus: {} as Record<string, string | number>,
     deployments: [] as unknown[],
-    fail: {} as { sentry?: number; vercel?: number; slack?: string; heartbeat?: number },
+    fail: {} as { sentry?: number; vercel?: number; slack?: string; heartbeat?: number; uptime?: number },
     sentryEvents: {} as Record<string, unknown>,
+    uptimeMonitors: [] as unknown[],
+    uptimeNextLink: null as string | null,
   };
   const calls: string[] = [];
   const slack: { channel: string; text: string; body: string }[] = [];
@@ -107,6 +109,11 @@ function world() {
       calls.push(`sentry:status:${id}`);
       const status = state.sentryStatus[id] ?? "unresolved";
       return typeof status === "number" ? json({}, status) : json({ id, status });
+    }
+    if (url.hostname === "api.uptimerobot.com") {
+      calls.push("uptime");
+      if (state.fail.uptime) return json({}, state.fail.uptime);
+      return json({ data: state.uptimeMonitors, ...(state.uptimeNextLink ? { nextLink: state.uptimeNextLink } : {}) });
     }
     if (url.hostname === "api.vercel.com") {
       calls.push("vercel");
@@ -676,6 +683,223 @@ describe("runCollect", () => {
       expect(requests).toEqual([]);
       expect(result.delivered).toMatchObject({ detailed: 1, analyzed: 0, analysisFailed: 0 });
     });
+  });
+
+  describe("외부 감시(UptimeRobot)", () => {
+    const UPTIME = { apiKey: "ur-test-token" };
+    const WATCHED: Target = { ...TARGET, uptime: { hosts: ["site-a.example"] } };
+
+    function uptimeMonitor(id: number, status: string, startedAt: string | null = null, path = "/api/health") {
+      return {
+        id,
+        friendlyName: `감시 ${id}`,
+        url: `https://site-a.example${path}`,
+        type: "HTTP",
+        status,
+        currentStateDuration: 60,
+        lastIncident: startedAt
+          ? { id: "1", status: "Ongoing", cause: 404, reason: "404 Not Found", startedAt, duration: null }
+          : null,
+      };
+    }
+
+    const watchDeps = (time: string, overrides: Partial<CollectDeps> = {}) =>
+      deps(time, { targets: [WATCHED], uptimeRobot: UPTIME, ...overrides });
+
+    it("다운된 감시를 P1 incident로 만들어 Slack으로 보내고, 다른 호스트의 감시는 무시한다", async () => {
+      w.state.uptimeMonitors = [
+        uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z"),
+        uptimeMonitor(11, "UP"),
+        { ...uptimeMonitor(12, "DOWN", "2026-11-09T00:50:00.000Z"), url: "https://other.example/" },
+      ];
+      const create = vi.fn();
+
+      const result = await runCollect(
+        watchDeps("01:00", { anthropicApiKey: "test-key", claude: { messages: { create } } as unknown as ClaudeClient }),
+      );
+
+      expect(result.steps).toContainEqual({ target: "site-a", step: "uptime", ok: true, received: 2, skipped: 0 });
+      expect(result.ingested.created).toBe(1);
+      expect(w.slack).toHaveLength(1);
+      expect(w.slack[0].text).toContain("[P1][사이트 A] 외부 감시 다운 (404 Not Found)");
+      expect(w.slack[0].body).toContain("외부 감시 다운 · 영역 전체");
+      expect(w.slack[0].body).toContain("다운 시작 11/09 09:57 (KST)");
+      expect(w.slack[0].body).toContain("경로 /api/health");
+      expect(w.slack[0].body).toContain("UptimeRobot에서 보기");
+      expect(w.slack[0].body).toContain("https://dashboard.uptimerobot.com/monitors/10");
+      // 요약할 오류 문구가 없어 Claude를 부르지 않는다
+      expect(create).not.toHaveBeenCalled();
+      expect(result.heartbeat).toBe("sent");
+    });
+
+    it("다운이 이어지는 동안은 다시 알리지 않고, 해결 버튼으로 닫으면 같은 다운으로는 다시 열지 않는다", async () => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+      await runCollect(watchDeps("01:00"));
+      await runCollect(watchDeps("01:05"));
+      expect(w.slack).toHaveLength(1);
+
+      const [incident] = await listOpenUptime();
+      await db.execute({
+        sql: "UPDATE incidents SET status = 'resolved', resolved_at = ? WHERE id = ?",
+        args: [at("01:06").toISOString(), incident.id],
+      });
+
+      const again = await runCollect(watchDeps("01:10"));
+      expect(again.ingested.reopened).toBe(0);
+      expect(w.slack).toHaveLength(1);
+    });
+
+    it("새로 다운되면(시작 시각이 바뀌면) 재발로 다시 알린다", async () => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+      await runCollect(watchDeps("01:00"));
+
+      w.state.uptimeMonitors = [uptimeMonitor(10, "UP")];
+      const recovered = await runCollect(watchDeps("01:05"));
+      expect(recovered.ingested.resolved).toBe(1);
+
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T01:07:00.000Z")];
+      const again = await runCollect(watchDeps("01:10"));
+      expect(again.ingested.reopened).toBe(1);
+      expect(w.slack).toHaveLength(2);
+      expect(w.slack[1].body).toContain("재발 (2회차)");
+      expect(w.slack[1].body).toContain("다운 시작 11/09 10:07 (KST)");
+    });
+
+    it.each([
+      ["멈춤(PAUSED)", [uptimeMonitor(10, "PAUSED")], 1],
+      ["목록에서 사라짐", [], 1],
+      ["준비 중(STARTED)", [uptimeMonitor(10, "STARTED")], 0],
+    ])("열린 incident: %s → 해결 %i건", async (_label, after, resolved) => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+      await runCollect(watchDeps("01:00"));
+
+      w.state.uptimeMonitors = after;
+      const result = await runCollect(watchDeps("01:05"));
+      expect(result.ingested.resolved).toBe(resolved);
+    });
+
+    it("목록은 실행당 한 번만 읽고 사이트마다 나눈다", async () => {
+      const second: Target = { ...NO_SENTRY, uptime: { hosts: ["site-b.example"] } };
+      w.state.uptimeMonitors = [
+        uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z"),
+        { ...uptimeMonitor(20, "DOWN", "2026-11-09T00:58:00.000Z"), url: "https://site-b.example/" },
+      ];
+
+      const result = await runCollect(watchDeps("01:00", { targets: [WATCHED, second] }));
+
+      expect(w.calls.filter((call) => call === "uptime")).toHaveLength(1);
+      expect(result.ingested.created).toBe(2);
+      expect(w.slack.map((m) => m.channel).sort()).toEqual(["#ops-a", "#ops-b"]);
+    });
+
+    it("UptimeRobot이 실패하면 그 단계를 실패로 남기고 다른 수집은 계속하며 heartbeat는 보내지 않는다", async () => {
+      w.state.fail.uptime = 401;
+      w.state.sentryIssues = [sentryIssue("101")];
+
+      const result = await runCollect(watchDeps("01:00"));
+
+      expect(result.steps).toContainEqual({ target: "site-a", step: "uptime", ok: false, reason: "auth" });
+      expect(result.steps).toContainEqual(expect.objectContaining({ step: "sentry", ok: true }));
+      expect(result.ingested.created).toBe(1);
+      expect(result.heartbeat).toBe("skipped");
+    });
+
+    it("키가 없거나 감시 호스트를 정하지 않은 사이트면 단계도 요청도 없다", async () => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+
+      const noKey = await runCollect(watchDeps("01:00", { uptimeRobot: null }));
+      const noHosts = await runCollect(deps("01:05", { uptimeRobot: UPTIME }));
+
+      for (const result of [noKey, noHosts]) {
+        expect(result.steps.map(({ step }) => step)).not.toContain("uptime");
+      }
+      expect(w.calls).not.toContain("uptime");
+    });
+
+    it("[리뷰 P1] 수집 사이에 회복했다가 다시 다운되면(UP을 못 봐도) 새 회차로 다시 알린다", async () => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+      await runCollect(watchDeps("01:00"));
+
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T01:03:00.000Z")];
+      const again = await runCollect(watchDeps("01:05"));
+
+      expect(again.ingested.reopened).toBe(1);
+      expect(w.slack).toHaveLength(2);
+      expect(w.slack[1].body).toContain("재발 (2회차)");
+      expect(w.slack[1].body).toContain("다운 시작 11/09 10:03 (KST)");
+    });
+
+    it("[리뷰 P1] 옛 메시지의 해결 버튼을 새 다운이 시작된 뒤에 눌러도 새 다운을 알린다", async () => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+      await runCollect(watchDeps("01:00"));
+      // 01:03에 새로 다운됐지만 아직 수집하지 못한 채, 01:04에 옛 메시지의 해결 버튼을 누른다
+      const [incident] = await listOpenUptime();
+      await db.execute({
+        sql: "UPDATE incidents SET status = 'resolved', resolved_at = ? WHERE id = ?",
+        args: [at("01:04").toISOString(), incident.id],
+      });
+
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T01:03:00.000Z")];
+      const again = await runCollect(watchDeps("01:05"));
+
+      expect(again.ingested.reopened).toBe(1);
+      expect(w.slack).toHaveLength(2);
+    });
+
+    it("지속 시간으로 계산한 시작 시각이 1초 흔들려도 같은 다운으로 본다", async () => {
+      const byDuration = (seconds: number) => ({ ...uptimeMonitor(10, "DOWN"), currentStateDuration: seconds });
+      w.state.uptimeMonitors = [byDuration(180)]; // 01:00 기준 00:57:00
+      await runCollect(watchDeps("01:00"));
+      const [incident] = await listOpenUptime();
+      await db.execute({
+        sql: "UPDATE incidents SET status = 'resolved', resolved_at = ? WHERE id = ?",
+        args: [at("01:01").toISOString(), incident.id],
+      });
+
+      w.state.uptimeMonitors = [byDuration(481)]; // 01:05 기준 00:56:59
+      const again = await runCollect(watchDeps("01:05"));
+
+      expect(again.ingested.reopened).toBe(0);
+      expect(w.slack).toHaveLength(1);
+    });
+
+    it("[리뷰 P2] 형식이 다른 항목이 있으면 목록에 없다는 이유로 닫지 않는다", async () => {
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+      await runCollect(watchDeps("01:00"));
+
+      w.state.uptimeMonitors = [{ ...uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z"), currentStateDuration: "x" }];
+      const result = await runCollect(watchDeps("01:05"));
+
+      expect(result.ingested.resolved).toBe(0);
+      expect(await listOpenUptime()).toHaveLength(1);
+      expect(result.steps).toContainEqual(
+        expect.objectContaining({ step: "uptime", ok: false, reason: "invalid_items", skipped: 1 }),
+      );
+      expect(result.heartbeat).toBe("skipped");
+    });
+
+    it("[리뷰 P2] 쪽 수 상한에 닿으면 읽은 만큼 알리되 단계를 실패로 남기고, 없는 감시를 닫지 않는다", async () => {
+      // 01:00: 감시 20이 다운 → incident
+      w.state.uptimeMonitors = [{ ...uptimeMonitor(20, "DOWN", "2026-11-09T00:50:00.000Z"), url: "https://site-a.example/x" }];
+      await runCollect(watchDeps("01:00"));
+
+      // 01:05: 감시 20은 뒤쪽(못 읽은 쪽)에 있고, 앞쪽에서 감시 10이 새로 다운
+      w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T01:02:00.000Z")];
+      w.state.uptimeNextLink = "https://api.uptimerobot.com/v3/monitors?limit=50&cursor=1";
+      const result = await runCollect(watchDeps("01:05"));
+
+      expect(w.calls.filter((call) => call === "uptime")).toHaveLength(1 + 4);
+      expect(result.steps).toContainEqual({ target: "site-a", step: "uptime", ok: false, reason: "incomplete" });
+      expect(result.ingested.created).toBe(1);
+      expect(result.ingested.resolved).toBe(0);
+      expect(await listOpenUptime()).toHaveLength(2);
+      expect(result.heartbeat).toBe("skipped");
+    });
+
+    async function listOpenUptime() {
+      const { rows } = await db.execute("SELECT id FROM incidents WHERE fingerprint LIKE 'uptime:%' AND status = 'open'");
+      return rows.map((row) => ({ id: Number(row.id) }));
+    }
   });
 });
 

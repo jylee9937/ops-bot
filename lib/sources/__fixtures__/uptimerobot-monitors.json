@@ -1,0 +1,87 @@
+{
+  "data": [
+    {
+      "type": "HTTP",
+      "interval": 300,
+      "httpMethodType": "HEAD",
+      "httpUsername": "",
+      "httpPassword": "",
+      "keywordValue": "",
+      "keywordType": null,
+      "id": 900000001,
+      "friendlyName": "site-a.example/api/health",
+      "status": "UP",
+      "url": "https://site-a.example/api/health",
+      "currentStateDuration": 7698100,
+      "lastIncidentId": null,
+      "lastIncident": null,
+      "tags": [],
+      "createDateTime": "2026-08-13T07:46:44.000Z"
+    },
+    {
+      "type": "KEYWORD",
+      "interval": 300,
+      "httpMethodType": "GET",
+      "keywordValue": "player.example/embed",
+      "keywordType": "ALERT_NOT_EXISTS",
+      "keywordCaseType": 1,
+      "id": 900000002,
+      "friendlyName": "재생 점검(숨김 강의) kim@example.com",
+      "status": "UP",
+      "url": "https://site-a.example/learn/00000000-0000-0000-0000-000000000001",
+      "currentStateDuration": 533,
+      "lastIncidentId": null,
+      "lastIncident": null,
+      "createDateTime": "2026-11-10T09:59:31.000Z"
+    },
+    {
+      "type": "HTTP",
+      "interval": 300,
+      "httpMethodType": "HEAD",
+      "id": 900000003,
+      "friendlyName": "site-a.example/api/health-wrong",
+      "status": "DOWN",
+      "url": "https://site-a.example/api/health-wrong?token=abc",
+      "currentStateDuration": 17,
+      "lastIncidentId": "100000000000000001",
+      "lastIncident": {
+        "id": "100000000000000001",
+        "status": "Ongoing",
+        "cause": 404,
+        "reason": "404 Not Found",
+        "startedAt": "2026-11-10T10:12:24.440Z",
+        "duration": null
+      },
+      "createDateTime": "2026-11-10T10:11:12.000Z"
+    },
+    {
+      "type": "HTTP",
+      "interval": 300,
+      "id": 900000004,
+      "friendlyName": "other.example",
+      "status": "DOWN",
+      "url": "https://other.example/",
+      "currentStateDuration": 600,
+      "lastIncidentId": "1",
+      "lastIncident": {
+        "id": "1",
+        "status": "Ongoing",
+        "cause": 500,
+        "reason": "500 Internal Server Error",
+        "startedAt": "2026-11-10T10:00:00.000Z",
+        "duration": null
+      }
+    },
+    {
+      "type": "HTTP",
+      "interval": 300,
+      "id": 900000005,
+      "friendlyName": "site-a.example/login",
+      "status": "STARTED",
+      "url": "https://site-a.example/login",
+      "currentStateDuration": 39,
+      "lastIncidentId": null,
+      "lastIncident": null
+    }
+  ]
+}

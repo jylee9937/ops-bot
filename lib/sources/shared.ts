@@ -13,7 +13,9 @@ export type SourceErrorReason =
   | "server"
   | "bad_request"
   | "network"
-  | "invalid_response";
+  | "invalid_response"
+  // 쪽 수 상한에 닿아 목록을 다 읽지 못했다. 읽은 만큼은 처리하되 단계는 실패로 남긴다.
+  | "incomplete";
 
 /** 출처 하나의 실패. collect가 격리한다. 메시지에 URL·토큰·응답 본문을 넣지 않는다. */
 export class SourceError extends Error {

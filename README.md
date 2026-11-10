@@ -9,7 +9,7 @@ Sentry, Vercel, Supabase를 각각 열어 비교하지 않아도 "배포 직후�
 ```
 Vercel Cron (5분) ─▶ collect ─▶ 잠금 획득 실패면 종료
                        │
-         사이트 × 출처마다 (실패는 서로 격리)
+         사이트 × 출처(Sentry · Vercel · UptimeRobot)마다 (실패는 서로 격리)
          수집기: 응답을 받는 즉시 마스킹 ─▶ Signal
                        │                 ▲
 Vercel webhook ─서명 검증─▶ ingest ◀─────┘
@@ -39,6 +39,7 @@ Vercel webhook ─서명 검증─▶ ingest ◀─────┘
 - [x] 배포 실패 webhook
 - [x] Claude 요약과 평가
 - [x] Slack 명령 `/ops`(상태·수동 수집·가벼운 eval)
+- [x] 외부 감시(UptimeRobot) 다운 알림
 - [ ] 통합 대시보드
 
 ## 개발
@@ -82,6 +83,13 @@ pnpm dev
 - 같은 회차·등급의 요약은 저장해 두고 다시 보낼 때 재사용합니다. 등급이 오르거나 다시 열리면 새로 만듭니다.
 - 같은 시각(앞뒤 5분) 다른 사이트에도 에러가 있으면 incident는 따로 두고 메시지에 그 사이트와 Vercel·Supabase 상태 페이지 링크를 붙입니다.
 - `ANTHROPIC_API_KEY`가 없으면 요약 없이 동작합니다. 프롬프트나 모델을 바꿀 때는 `pnpm eval`로 판정(의심 계층·배포 연관·교차 사이트)과 주입 내성을 확인합니다. 시나리오는 `evals/scenarios.ts`.
+
+### 외부 감시(UptimeRobot)
+
+- UptimeRobot 무료 요금제는 Slack 연동이 유료라, collect가 실행마다 v3 API(`GET /v3/monitors`, Read-only 키)를 한 번 읽어 다운된 감시를 P1 incident로 보냅니다. 다시 UP이 되거나 멈추거나 목록에서 사라지면 자동으로 해결 처리합니다.
+- 어느 사이트 것인지는 감시 URL의 호스트로 정합니다(`OPS_TARGETS`의 `uptime.hosts`). 감시 이름은 사용자가 쓴 글이라 읽지 않고, 경로는 다른 출처와 같은 마스킹을 거칩니다.
+- 같은 다운은 시작 시각(`lastIncident.startedAt`)으로 구별합니다. 다운이 이어지는 동안은 다시 알리지 않고, 해결 버튼으로 닫아도 같은 다운으로는 다시 열지 않으며, 새로 다운되면 재발로 알립니다.
+- 요약할 오류 문구가 없어 Claude 요약은 부르지 않습니다. UptimeRobot의 이메일 알림은 켜 둡니다(ops-bot이 멈춰도 오는 독립 경로).
 
 ### Slack 앱
 
