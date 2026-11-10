@@ -1,4 +1,11 @@
 import type { Client } from "@libsql/client";
+import {
+  claudeClient,
+  createAnalyzer,
+  DAILY_ANALYSIS_LIMIT,
+  type AnalysisFailure,
+  type ClaudeClient,
+} from "./analysis";
 import type { CollectEnv } from "./env";
 import {
   acquireLock,
@@ -10,13 +17,14 @@ import {
   purgeExpired,
   recordDeploys,
   releaseLock,
+  reserveAnalysisCall,
   resolveIncident,
   saveCursor,
   type IngestSummary,
 } from "./incidents";
 import { deliverPending } from "./report";
 import { postMessage, SlackError } from "./slack";
-import { collectSentry, fetchSentryIssueStatus } from "./sources/sentry";
+import { collectSentry, fetchSentryFrames, fetchSentryIssueStatus } from "./sources/sentry";
 import { SourceError, type RequestOptions } from "./sources/shared";
 import { collectVercel } from "./sources/vercel";
 import type { Target } from "./targets";
@@ -32,6 +40,8 @@ const SENTRY_ISSUE_ID = /^\d{1,20}$/;
 const MIGRATION_ATTEMPTS = 3;
 const CRON_INTERVAL_MS = 5 * 60_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
+// 스택은 보조 정보다. 늦으면 스택 없이 보낸다.
+const FRAMES_TIMEOUT_MS = 5_000;
 
 export type Step = "vercel" | "sentry" | "sentry-status" | "slack";
 /**
@@ -53,7 +63,7 @@ export type CollectResult = {
   status: "done" | "locked";
   steps: StepResult[];
   ingested: IngestSummary;
-  delivered: { detailed: number; bundled: number; skipped: number };
+  delivered: { detailed: number; bundled: number; skipped: number; analyzed: number; analysisFailed: number };
   heartbeat: "sent" | "skipped" | "failed" | "disabled";
 };
 
@@ -65,6 +75,8 @@ export type CollectDeps = CollectEnv & {
   sleep?: (ms: number) => Promise<void>;
   budgetMs?: number;
   holder?: string;
+  // 테스트에서 Claude API 대신 쓴다. 키가 있을 때만 부른다.
+  claude?: ClaudeClient;
 };
 
 /** 오류를 고정된 이유 문자열로 줄인다. 메시지·URL·토큰은 밖으로 내보내지 않는다. */
@@ -100,7 +112,8 @@ export function rotate<T>(items: readonly T[], now: Date, limit: number): T[] {
  */
 export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
   const { db, targets, sentry, vercel, slack, heartbeatUrl } = deps;
-  const now = (deps.now ?? (() => new Date()))();
+  const clock = deps.now ?? (() => new Date());
+  const now = clock();
   const budgetMs = deps.budgetMs ?? RUN_BUDGET_MS;
   const deadline = Date.now() + budgetMs;
   const signal = AbortSignal.timeout(budgetMs);
@@ -109,7 +122,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     status: "done",
     steps: [],
     ingested: emptySummary(),
-    delivered: { detailed: 0, bundled: 0, skipped: 0 },
+    delivered: { detailed: 0, bundled: 0, skipped: 0, analyzed: 0, analysisFailed: 0 },
     heartbeat: "skipped",
   };
 
@@ -191,20 +204,53 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
       }
     }
 
+    // 실행당·하루 상한을 넘으면 템플릿으로 보낸다(D9). 실행당 상한은 두 사이트가 함께 쓴다.
+    const apiKey = deps.anthropicApiKey;
+    const analyzer = apiKey
+      ? createAnalyzer({
+          client: deps.claude ?? claudeClient(apiKey),
+          // 실행 시작 시각이 아니라 부르는 순간의 날짜로 센다. 자정을 넘긴 실행이 전날 칸을 쓰지 않게.
+          reserveDaily: () => reserveAnalysisCall(db, clock(), DAILY_ANALYSIS_LIMIT),
+        })
+      : undefined;
+
     // 모든 사이트를 수집한 뒤 보낸다. Slack 간격·재시도 대기가 뒤 사이트의 수집 예산을 먹지 않게 한다.
     // 보내는 중인 전송에는 실행 예산의 끊기 신호를 걸지 않고(자체 10초 제한만), 새 전송 전에만 예산을 본다.
     for (const target of targets) {
+      const sentryTarget = target.sentry;
       await run(target, "slack", async () => {
         const delivery = await deliverPending(
           db,
           target,
           now,
           (message) => postMessage(message, slack.token, { fetchImpl: deps.fetchImpl }),
-          { ownerUserId: slack.ownerUserId, sleep: deps.sleep, shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline },
+          {
+            ownerUserId: slack.ownerUserId,
+            sleep: deps.sleep,
+            shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline,
+            analyzer,
+            sites: targets,
+            frames:
+              sentryTarget && sentry
+                ? async (incident) =>
+                    // 해결 확인과 같은 이유로 수집기가 만든 숫자 id만 경로에 넣는다.
+                    SENTRY_ISSUE_ID.test(incident.evidence.sourceId)
+                      ? fetchSentryFrames(sentryTarget, sentry, incident.evidence.sourceId, {
+                          fetchImpl: deps.fetchImpl,
+                          signal: AbortSignal.timeout(FRAMES_TIMEOUT_MS),
+                        })
+                      : []
+                : undefined,
+          },
         );
         result.delivered.detailed += delivery.detailed;
         result.delivered.bundled += delivery.bundled;
         result.delivered.skipped += delivery.skipped;
+        result.delivered.analyzed += delivery.analyzed;
+        result.delivered.analysisFailed += delivery.analysisFailures.length;
+        if (delivery.analysisFailures.length > 0) {
+          console.error(`[collect] ${target.id} 요약 없이 보냄: ${countReasons(delivery.analysisFailures)}`);
+        }
         if (delivery.error) throw delivery.error;
       });
     }
@@ -224,6 +270,13 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     await releaseLock(db, LOCK_NAME, holder);
   }
   return result;
+}
+
+/** 실패 이유를 `timeout×2, daily_limit×1`처럼 센다. 내용은 담지 않는다. */
+function countReasons(reasons: readonly AnalysisFailure[]): string {
+  const counts = new Map<AnalysisFailure, number>();
+  for (const reason of reasons) counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  return [...counts].map(([reason, count]) => `${reason}×${count}`).join(", ");
 }
 
 async function ping(url: string, fetchImpl: typeof fetch = fetch): Promise<"sent" | "failed"> {

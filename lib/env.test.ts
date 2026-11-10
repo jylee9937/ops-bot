@@ -16,6 +16,7 @@ const SECRET_VALUES = {
   SENTRY_TOKEN: "sentry-secret-value",
   VERCEL_TOKEN: "vercel-secret-value",
   SLACK_BOT_TOKEN: "xoxb-slack-secret-value",
+  ANTHROPIC_API_KEY: "anthropic-secret-value",
 };
 
 function env(overrides: Record<string, string | undefined> = {}) {
@@ -49,7 +50,13 @@ describe("loadCollectEnv", () => {
       vercel: { teamId: "team_abc123", token: "vercel-secret-value" },
       slack: { token: "xoxb-slack-secret-value", ownerUserId: "U0OWNER1" },
       heartbeatUrl: "https://hc-ping.example/abc",
+      anthropicApiKey: "anthropic-secret-value",
     });
+  });
+
+  it("Claude 키는 선택이다. 없으면 null이고 다른 설정은 그대로 쓴다", () => {
+    expect(loadCollectEnv(env({ ANTHROPIC_API_KEY: undefined })).anthropicApiKey).toBeNull();
+    expect(loadCollectEnv(env({ ANTHROPIC_API_KEY: "" })).anthropicApiKey).toBeNull();
   });
 
   it("heartbeat 주소가 없으면 null이다(Preview)", () => {

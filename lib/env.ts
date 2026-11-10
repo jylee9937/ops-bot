@@ -11,6 +11,8 @@ export type CollectEnv = {
   vercel: VercelConfig;
   slack: { token: string; ownerUserId: string };
   heartbeatUrl: string | null;
+  // 없으면 Claude 요약 없이 템플릿으로만 알린다.
+  anthropicApiKey: string | null;
 };
 
 /** 설정 오류. 문제가 있는 변수 이름만 담는다. 값은 담지 않는다. */
@@ -34,11 +36,13 @@ const schema = z.object({
   SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   SLACK_OWNER_USER_ID: z.string().refine((value) => isSlackUserId(value)),
   HEARTBEAT_URL: z.preprocess(optional, z.url({ protocol: /^https$/ }).optional()),
+  // 형식은 검사하지 않는다. 잘못된 키는 수집을 막지 않고, 알림에 'API 키 확인 필요'로 드러난다.
+  ANTHROPIC_API_KEY: z.preprocess(optional, z.string().min(1).optional()),
 });
 
 /**
  * collect가 쓰는 환경변수를 한 번에 검사한다. 하나라도 틀리면 그 이름들을 담아 던진다.
- * Sentry는 Sentry를 쓰는 target이 있을 때만 필요하다. heartbeat는 운영에만 둔다.
+ * Sentry는 Sentry를 쓰는 target이 있을 때만 필요하다. heartbeat는 운영에만 둔다. Claude 키는 선택이다.
  */
 export function loadCollectEnv(env: Record<string, string | undefined>): CollectEnv {
   const parsed = schema.safeParse(env);
@@ -72,5 +76,6 @@ export function loadCollectEnv(env: Record<string, string | undefined>): Collect
     vercel: { teamId: data.VERCEL_TEAM_ID, token: data.VERCEL_TOKEN },
     slack: { token: data.SLACK_BOT_TOKEN, ownerUserId: data.SLACK_OWNER_USER_ID },
     heartbeatUrl: data.HEARTBEAT_URL ?? null,
+    anthropicApiKey: data.ANTHROPIC_API_KEY ?? null,
   };
 }

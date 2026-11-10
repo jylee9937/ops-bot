@@ -109,6 +109,7 @@ describe("handleDeployFailure", () => {
       vercel: { teamId: "team_test", token: "vercel-test-token" },
       slack: SLACK,
       heartbeatUrl: null,
+      anthropicApiKey: null,
       fetchImpl: slack.impl,
       sleep: async () => {},
       now: () => at("01:05"),

@@ -25,11 +25,14 @@ import {
   releaseClaim,
   releaseLock,
   releaseNotification,
+  reserveAnalysisCall,
   resolveIncident,
+  saveAnalysis,
   saveCursor,
   type Incident,
+  type StoredAnalysis,
 } from "./incidents";
-import { maskLogMessage, tagOf } from "./mask";
+import { maskFrame, maskLogMessage, tagOf } from "./mask";
 import type { Deploy, Signal } from "./signal";
 import type { Target } from "./targets";
 
@@ -943,6 +946,7 @@ describe("incidents", () => {
       await recordDeploys(db, [deploy({ createdAt: OLD.toISOString() })], OLD);
       await muteIncident(db, "site-a", "sentry:9", OLD, OLD);
       await acquireLock(db, "collect", "run-1", OLD);
+      await reserveAnalysisCall(db, OLD, 50);
 
       await purgeExpired(db, NOW);
 
@@ -950,6 +954,7 @@ describe("incidents", () => {
       expect(await count("deploys")).toBe(0);
       expect(await count("mutes")).toBe(0);
       expect(await count("locks")).toBe(0);
+      expect(await count("analysis_usage")).toBe(0);
     });
 
     it("열린 incident와 최근 행은 남긴다", async () => {
@@ -957,6 +962,7 @@ describe("incidents", () => {
       await recordDeploys(db, [deploy({ createdAt: "2027-05-30T00:00:00.000Z" })], NOW);
       await muteIncident(db, "site-a", "sentry:9", new Date("2027-05-30T00:00:00.000Z"), NOW);
       await acquireLock(db, "collect", "run-1", NOW);
+      await reserveAnalysisCall(db, NOW, 50);
 
       await purgeExpired(db, NOW);
 
@@ -964,6 +970,70 @@ describe("incidents", () => {
       expect(await count("deploys")).toBe(1);
       expect(await count("mutes")).toBe(1);
       expect(await count("locks")).toBe(1);
+      expect(await count("analysis_usage")).toBe(1);
+    });
+  });
+
+  describe("Claude 요약 저장·하루 상한", () => {
+    const stored = (overrides: Partial<StoredAnalysis> = {}): StoredAnalysis => ({
+      key: "1:P2",
+      previousTs: null,
+      result: {
+        summary: "DB 시간 초과로 목록 조회가 실패합니다.",
+        suspectedLayer: "DB",
+        deployRelated: false,
+        crossSite: false,
+        userImpact: "목록이 비어 보입니다.",
+        nextChecks: ["쿼리 지연 확인"],
+        confidence: "중간",
+      },
+      model: "claude-opus-5-5",
+      frames: [maskFrame({ filename: "src/queries.ts", function: "list", line: 3 })],
+      correlated: ["site-b"],
+      at: iso("01:00"),
+      ...overrides,
+    });
+
+    it("전송 표를 쥔 동안 요약을 저장하고, 알림 상태와 버전은 그대로다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      const before = await row();
+      expect(before.analysis).toBeNull();
+
+      const { claim } = await claimPending(db, TARGET.id, at("01:01"));
+      expect(await saveAnalysis(db, before.id, claim, stored())).toBe(true);
+      await releaseClaim(db, claim);
+      const after = await row();
+      expect(after.analysis).toEqual(stored());
+      expect(after.version).toBe(before.version);
+      expect(await pendingIds(at("01:02"))).toEqual(["sentry:1"]);
+    });
+
+    it("요약을 만드는 사이 표가 무효가 되면(등급 상승 등) 저장하지 않는다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      const { claim } = await claimPending(db, TARGET.id, at("01:01"));
+      // 10분 안에 5번 늘어 등급이 오르면 진행 중인 표가 무효가 된다
+      await ingest(db, TARGET, [issue({ count: 6, lastSeen: iso("01:02") })], at("01:02"));
+
+      expect(await saveAnalysis(db, (await row()).id, claim, stored())).toBe(false);
+      expect((await row()).analysis).toBeNull();
+    });
+
+    it("하루 상한까지만 예약하고, 동시에 불려도 넘지 않는다", async () => {
+      const results = await Promise.all(Array.from({ length: 5 }, () => reserveAnalysisCall(db, at("01:00"), 3)));
+      expect(results.filter(Boolean)).toHaveLength(3);
+      expect(await reserveAnalysisCall(db, at("02:00"), 3)).toBe(false);
+      expect(await reserveAnalysisCall(db, at("02:00"), 0)).toBe(false);
+    });
+
+    it("날짜는 KST로 센다. 한국 자정(UTC 15시)에 새로 시작한다", async () => {
+      expect(await reserveAnalysisCall(db, new Date("2026-11-07T14:59:00.000Z"), 1)).toBe(true);
+      expect(await reserveAnalysisCall(db, new Date("2026-11-07T14:59:59.000Z"), 1)).toBe(false);
+      expect(await reserveAnalysisCall(db, new Date("2026-11-07T15:00:00.000Z"), 1)).toBe(true);
+      const { rows } = await db.execute("SELECT day, calls FROM analysis_usage ORDER BY day");
+      expect(rows.map((r) => [r.day, r.calls])).toEqual([
+        ["2026-11-07", 1],
+        ["2026-11-08", 1],
+      ]);
     });
   });
 });

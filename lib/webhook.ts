@@ -19,6 +19,8 @@ export type WebhookDeps = Pick<CollectEnv, "slack"> & {
   sleep?: (ms: number) => Promise<void>;
   // 요청이 들어온 시각(ms). 예산은 여기서부터 센다. 없으면 이 함수를 부른 시각.
   startedAt?: number;
+  // 설정된 모든 사이트. 같은 시각 에러가 난 다른 사이트의 이름을 적는다.
+  sites?: readonly Target[];
 };
 
 export type WebhookResult = {
@@ -54,6 +56,8 @@ export async function handleDeployFailure(
       ownerUserId: slack.ownerUserId,
       sleep: deps.sleep,
       shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline,
+      // Claude는 부르지 않는다. 30초 응답 제한 안에 끝내야 하고, 배포 실패는 요약할 오류 문구가 없다.
+      sites: deps.sites,
     },
   );
   return {
