@@ -24,7 +24,14 @@ import {
   type Send,
 } from "./report";
 import type { Signal } from "./signal";
-import { SlackError, type Interaction, type SlackBlock, type SlackMessage, type SlackResponse } from "./slack";
+import {
+  ephemeral,
+  SlackError,
+  type Interaction,
+  type SlackBlock,
+  type SlackMessage,
+  type SlackResponse,
+} from "./slack";
 import type { Target } from "./targets";
 
 const at = (time: string) => new Date(`2026-11-07T${time}:00.000Z`);
@@ -590,7 +597,7 @@ describe("report", () => {
 
   describe("handleAction", () => {
     const replaced = (response: SlackResponse) => {
-      if (!("blocks" in response)) throw new Error(`원래 메시지를 바꾸지 않았습니다: ${response.text}`);
+      if (!response.replace_original) throw new Error(`원래 메시지를 바꾸지 않았습니다: ${response.text}`);
       return response;
     };
 
@@ -653,11 +660,9 @@ describe("report", () => {
       const incident = await byFingerprint("sentry:1");
       await handleAction(db, [TARGET], interaction(incident), at("02:00"));
 
-      expect(await handleAction(db, [TARGET], interaction(incident), at("02:01"))).toEqual({
-        response_type: "ephemeral",
-        replace_original: false,
-        text: "이미 해결된 incident입니다.",
-      });
+      expect(await handleAction(db, [TARGET], interaction(incident), at("02:01"))).toEqual(
+        ephemeral("이미 해결된 incident입니다."),
+      );
     });
 
     it("다시 열린 뒤 옛 회차 메시지로는 해결하지 않는다", async () => {

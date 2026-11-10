@@ -16,11 +16,14 @@ import {
   prepareDb,
   purgeExpired,
   recordDeploys,
+  recordRun,
   releaseLock,
   reserveAnalysisCall,
   resolveIncident,
   saveCursor,
+  type CollectRun,
   type IngestSummary,
+  type RunCaller,
 } from "./incidents";
 import { deliverPending } from "./report";
 import { postMessage, SlackError } from "./slack";
@@ -37,11 +40,12 @@ export const STATUS_CHECK_LIMIT = 10;
 // 열린 incident가 이보다 많으면 넘는 몫은 확인하지 않는다(지금 규모에서는 닿지 않는 값).
 const MAX_OPEN_SCAN = 500;
 const SENTRY_ISSUE_ID = /^\d{1,20}$/;
-const MIGRATION_ATTEMPTS = 3;
 const CRON_INTERVAL_MS = 5 * 60_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 // 스택은 보조 정보다. 늦으면 스택 없이 보낸다.
 const FRAMES_TIMEOUT_MS = 5_000;
+// 실행 기록은 보조 정보다. 늦으면 기다리지 않고 결과를 돌려준다(route 제한 시간 안에 끝나게).
+const RECORD_TIMEOUT_MS = 5_000;
 
 export type Step = "vercel" | "sentry" | "sentry-status" | "slack";
 /**
@@ -77,6 +81,9 @@ export type CollectDeps = CollectEnv & {
   holder?: string;
   // 테스트에서 Claude API 대신 쓴다. 키가 있을 때만 부른다.
   claude?: ClaudeClient;
+  // 누가 불렀는지. 실행 기록(/ops status)에 남는다. 기본은 cron.
+  caller?: RunCaller;
+  recordTimeoutMs?: number;
 };
 
 /** 오류를 고정된 이유 문자열로 줄인다. 메시지·URL·토큰은 밖으로 내보내지 않는다. */
@@ -84,6 +91,15 @@ export function reasonOf(error: unknown): string {
   if (error instanceof SourceError || error instanceof SlackError) return error.reason;
   if (error instanceof Error && error.name === "TimeoutError") return "timeout";
   return "internal";
+}
+
+/** 끝나기를 `ms`까지만 기다린다. 넘으면 TimeoutError로 실패한다(작업 자체는 취소하지 못한다). */
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error("시간 초과"), { name: "TimeoutError" })), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
 function emptySummary(): IngestSummary {
@@ -109,6 +125,8 @@ export function rotate<T>(items: readonly T[], now: Date, limit: number): T[] {
  * → Slack 전송 → 보관 기간 정리 → heartbeat → 잠금 해제.
  * 출처 하나가 실패해도 나머지는 계속한다. 실패한 출처는 커서를 옮기지 않아 다음 실행이 다시 읽는다.
  * heartbeat는 모든 수집 단계가 성공하고 15분 넘게 못 보낸 알림이 없을 때만 보낸다(D21).
+ * 끝나면(잠금에 막혀도) 실행 결과 한 줄을 남긴다. 잠금을 먼저 풀고 남기며, 기록이 실패하거나
+ * 늦어져도 수집 결과·예외는 그대로 돌려준다.
  */
 export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
   const { db, targets, sentry, vercel, slack, heartbeatUrl } = deps;
@@ -126,18 +144,32 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     heartbeat: "skipped",
   };
 
-  // 잠금 표도 마이그레이션이 만든다. 잠금보다 먼저 적용한다.
-  // 처음 실행이 겹치면 한쪽이 '이미 있음'으로 실패한다. 다시 보면 적용된 버전은 건너뛴다.
-  for (let attempt = 1; ; attempt++) {
+  // 잠금 표도 마이그레이션이 만든다. 잠금보다 먼저 적용한다(겹치면 다시 시도).
+  await prepareDb(db);
+
+  const record = async (status: CollectRun["status"]) => {
     try {
-      await prepareDb(db);
-      break;
+      const run: CollectRun = {
+        caller: deps.caller ?? "cron",
+        startedAt: now.toISOString(),
+        finishedAt: clock().toISOString(),
+        status,
+        stepsOk: result.steps.filter(({ ok }) => ok).length,
+        stepsTotal: result.steps.length,
+        heartbeat: result.heartbeat,
+      };
+      await withTimeout(recordRun(db, run), deps.recordTimeoutMs ?? RECORD_TIMEOUT_MS);
     } catch (error) {
-      if (attempt >= MIGRATION_ATTEMPTS) throw error;
+      console.error(`[collect] 실행 기록 실패: ${reasonOf(error)}`);
     }
-  }
+  };
+
   const holder = deps.holder ?? crypto.randomUUID();
-  if (!(await acquireLock(db, LOCK_NAME, holder, now))) return { ...result, status: "locked" };
+  if (!(await acquireLock(db, LOCK_NAME, holder, now))) {
+    result.status = "locked";
+    await record("locked");
+    return result;
+  }
 
   /** 단계를 실행하고 결과를 남긴다. 돌려주는 값은 요청 자체가 성공했는지다(건너뛴 항목과 무관). */
   const run = async (target: Target, step: Step, work: () => Promise<Counts | void>) => {
@@ -159,6 +191,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     }
   };
 
+  let finished = false;
   try {
     for (const target of targets) {
       // 배포를 먼저 기록해야 Sentry incident의 '배포 직후'를 판단할 수 있다.
@@ -266,8 +299,14 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     } else {
       result.heartbeat = await ping(heartbeatUrl, deps.fetchImpl);
     }
+    finished = true;
   } finally {
-    await releaseLock(db, LOCK_NAME, holder);
+    // 잠금을 먼저 푼다. 기록이 늦어져도 다음 실행을 막지 않게.
+    try {
+      await releaseLock(db, LOCK_NAME, holder);
+    } finally {
+      await record(finished ? "done" : "failed");
+    }
   }
   return result;
 }

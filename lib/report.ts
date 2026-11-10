@@ -24,6 +24,7 @@ import {
 import type { MaskedFrame } from "./mask";
 import { windowIncrease } from "./rules";
 import {
+  ephemeral,
   escapeSlack,
   isSlackUserId,
   LINK_ACTION_ID,
@@ -80,7 +81,8 @@ export type IncidentState =
   | { kind: "resolved"; at: Date; by: string }
   | { kind: "muted"; until: Date; by: string };
 
-function kst(iso: string | Date): string {
+/** `MM/DD HH:mm`(KST). */
+export function kst(iso: string | Date): string {
   const date = new Date(new Date(iso).getTime() + KST_OFFSET_MS);
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${pad(date.getUTCMonth() + 1)}/${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
@@ -556,10 +558,6 @@ export async function deliverPending(
     await releaseClaim(db, claim);
   }
   return result;
-}
-
-function ephemeral(text: string): SlackResponse {
-  return { response_type: "ephemeral", replace_original: false, text };
 }
 
 function replace(message: SlackMessage): SlackResponse {

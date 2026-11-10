@@ -29,14 +29,24 @@ describe("migrate", () => {
   });
 
   it("빈 DB에 핵심 표를 만들고, 다시 실행해도 아무것도 하지 않는다", async () => {
-    expect(await migrate(db)).toEqual([1, 2, 3, 4]);
+    expect(await migrate(db)).toEqual([1, 2, 3, 4, 5]);
     expect(await migrate(db)).toEqual([]);
 
     const { rows } = await db.execute(
       "SELECT name FROM sqlite_master WHERE type = 'table'",
     );
     expect(rows.map((row) => row.name)).toEqual(
-      expect.arrayContaining(["analysis_usage", "cursors", "deploys", "incidents", "locks", "mutes"]),
+      expect.arrayContaining([
+        "analysis_usage",
+        "collect_runs",
+        "command_usage",
+        "cursors",
+        "deploys",
+        "incidents",
+        "locks",
+        "mutes",
+        "slack_requests",
+      ]),
     );
   });
 
@@ -49,7 +59,7 @@ describe("migrate", () => {
       args: [NOW, NOW, NOW],
     });
 
-    expect(await migrate(db)).toEqual([2, 3, 4]);
+    expect(await migrate(db)).toEqual([2, 3, 4, 5]);
 
     const { rows } = await db.execute(
       "SELECT fingerprint, pending_since, version FROM incidents ORDER BY fingerprint",

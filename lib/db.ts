@@ -90,6 +90,35 @@ const MIGRATIONS: readonly { version: number; statements: readonly string[] }[] 
         )`,
       ],
     },
+    {
+      version: 5,
+      statements: [
+        // collect 실행마다 결과 한 줄. /ops status가 마지막 수집·heartbeat를 보여 준다. incident 내용은 담지 않는다.
+        `CREATE TABLE collect_runs (
+          id INTEGER PRIMARY KEY,
+          caller TEXT NOT NULL CHECK (caller IN ('cron', 'slack')),
+          started_at TEXT NOT NULL,
+          finished_at TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('done', 'locked', 'failed')),
+          steps_ok INTEGER NOT NULL,
+          steps_total INTEGER NOT NULL,
+          heartbeat TEXT NOT NULL CHECK (heartbeat IN ('sent', 'skipped', 'failed', 'disabled'))
+        )`,
+        `CREATE INDEX collect_runs_caller_started ON collect_runs (caller, started_at)`,
+        // Slack 명령의 하루(KST) 사용 횟수. 알림 요약(analysis_usage)과 따로 센다.
+        `CREATE TABLE command_usage (
+          day TEXT NOT NULL,
+          command TEXT NOT NULL,
+          calls INTEGER NOT NULL,
+          PRIMARY KEY (day, command)
+        )`,
+        // 실행한 Slack 명령 요청(서명). 같은 요청이 다시 오면 실행하지 않는다. 서명은 5분만 유효하다.
+        `CREATE TABLE slack_requests (
+          id TEXT PRIMARY KEY,
+          seen_at TEXT NOT NULL
+        )`,
+      ],
+    },
   ];
 
 export function createDb(
