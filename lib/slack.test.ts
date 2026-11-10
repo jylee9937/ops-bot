@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { fakeFetch, jsonResponse } from "./sources/__fixtures__/fake-fetch";
 import {
+  ephemeral,
   escapeSlack,
+  MAX_SLACK_BODY_BYTES,
   parseInteraction,
+  parseSlashCommand,
   postMessage,
+  readSlackRequest,
   respond,
   SlackError,
   verifySlackSignature,
@@ -183,7 +187,7 @@ describe("respond", () => {
   it("response_url로 JSON을 보내고 실패하면 예외를 던진다", async () => {
     const fake = fakeFetch([new Response("ok"), new Response("", { status: 404 })]);
     const url = "https://hooks.slack.com/actions/T1/1/abc";
-    const body = { response_type: "ephemeral", replace_original: false, text: "안내" } as const;
+    const body = ephemeral("안내");
 
     await respond(url, body, { fetchImpl: fake.impl });
     await expect(respond(url, body, { fetchImpl: fake.impl })).rejects.toMatchObject({
@@ -246,5 +250,111 @@ describe("parseInteraction", () => {
     ]) {
       expect(parseInteraction(button({ response_url: responseUrl }))).toEqual({ kind: "invalid" });
     }
+  });
+});
+
+describe("readSlackRequest", () => {
+  const OWNER = "U0OWNER1";
+  const request = (body = DOC.body, headers: Record<string, string> = {}) =>
+    new Request("http://localhost/api/slack/commands", {
+      method: "POST",
+      headers: { "x-slack-request-timestamp": DOC.timestamp, "x-slack-signature": DOC.signature, ...headers },
+      body,
+    });
+  const check = (req: Request, overrides: { secret?: string; ownerUserId?: string; now?: Date } = {}) =>
+    readSlackRequest(req, { secret: DOC.secret, ownerUserId: OWNER, now: docNow(), ...overrides });
+
+  it("서명이 맞으면 원문·담당자 id·서명을 돌려준다", async () => {
+    expect(await check(request())).toEqual({ ok: true, body: DOC.body, ownerUserId: OWNER, signature: DOC.signature });
+  });
+
+  it("서명 비밀이나 담당자 id가 없거나 틀린 형식이면 500이다", async () => {
+    expect(await check(request(), { secret: "" })).toEqual({ ok: false, status: 500 });
+    expect(await check(request(), { ownerUserId: "" })).toEqual({ ok: false, status: 500 });
+    expect(await check(request(), { ownerUserId: "owner" })).toEqual({ ok: false, status: 500 });
+  });
+
+  it("본문이 너무 크면 서명을 계산하지 않고 413이다", async () => {
+    expect(await check(request("a".repeat(MAX_SLACK_BODY_BYTES + 1)))).toEqual({ ok: false, status: 413 });
+  });
+
+  it("서명이 틀리거나, 오래됐거나, 본문이 바뀌었으면 401이다", async () => {
+    expect(await check(request(DOC.body, { "x-slack-signature": "v0=00" }))).toEqual({ ok: false, status: 401 });
+    expect(await check(request(), { now: docNow(301) })).toEqual({ ok: false, status: 401 });
+    expect(await check(request(`${DOC.body}&text=status`))).toEqual({ ok: false, status: 401 });
+    expect(await check(request(), { secret: "other-secret" })).toEqual({ ok: false, status: 401 });
+  });
+});
+
+describe("parseSlashCommand", () => {
+  const RESPONSE_URL = "https://hooks.slack.com/commands/T1/2/abc";
+  const body = (fields: Record<string, string>) =>
+    new URLSearchParams({ command: "/ops", user_id: "U0OWNER1", response_url: RESPONSE_URL, text: "status", ...fields }).toString();
+
+  it("Slack 문서의 예시 요청을 읽는다(빈 text)", () => {
+    expect(parseSlashCommand(DOC.body)).toEqual({
+      kind: "command",
+      userId: "U2CERLKJA",
+      responseUrl: "https://hooks.slack.com/commands/T1DC2JH3J/397700885554/96rGlfmibIGlgcZRskXaIFfN",
+      text: "",
+    });
+  });
+
+  it("명령 이름은 검사하지 않는다(Preview용 이름을 따로 둘 수 있게)", () => {
+    expect(parseSlashCommand(body({ command: "/ops-preview" }))).toMatchObject({ kind: "command", text: "status" });
+  });
+
+  it("text가 없으면 빈 글자로 본다", () => {
+    const params = new URLSearchParams(body({}));
+    params.delete("text");
+    expect(parseSlashCommand(params.toString())).toMatchObject({ kind: "command", text: "" });
+  });
+
+  it("Slack의 인증서 확인 요청은 무시한다", () => {
+    expect(parseSlashCommand("ssl_check=1&token=xyz")).toEqual({ kind: "ignore" });
+  });
+
+  it.each([
+    ["user id 형식이 다르면", { user_id: "owner" }],
+    ["Slack 주소가 아니면", { response_url: "https://evil.example/commands/1" }],
+    ["http면", { response_url: "http://hooks.slack.com/commands/1" }],
+    ["포트가 붙으면", { response_url: "https://hooks.slack.com:8443/commands/1" }],
+    ["명령이 /로 시작하지 않으면", { command: "ops" }],
+    ["text가 너무 길면", { text: "a".repeat(201) }],
+  ])("%s 거부한다", (_label, fields) => {
+    expect(parseSlashCommand(body(fields))).toEqual({ kind: "invalid" });
+  });
+
+  it("필수 칸이 빠지면 거부한다", () => {
+    expect(parseSlashCommand("command=%2Fops&text=status")).toEqual({ kind: "invalid" });
+    expect(parseSlashCommand("")).toEqual({ kind: "invalid" });
+  });
+});
+
+describe("ephemeral", () => {
+  it("부른 사람에게만 보이고 원래 메시지는 바꾸지 않는다", () => {
+    expect(ephemeral("안내")).toEqual({
+      response_type: "ephemeral",
+      replace_original: false,
+      text: "안내",
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: "안내", verbatim: true } }],
+    });
+  });
+
+  it("[리뷰 P3] 일반 URL이 자동 링크가 되지 않게 verbatim 블록에 담는다", () => {
+    const response = ephemeral("확인: https://evil.example/login");
+    expect(response.blocks).toEqual([
+      { type: "section", text: { type: "mrkdwn", text: "확인: https://evil.example/login", verbatim: true } },
+    ]);
+  });
+
+  it("블록 글자 한도(3000자)를 넘으면 블록만 자른다", () => {
+    const long = "가".repeat(3_100);
+    const response = ephemeral(long);
+    const [block] = response.blocks;
+    if (block.type !== "section") throw new Error("section이 아님");
+    expect(Array.from(block.text.text)).toHaveLength(3_000);
+    expect(block.text.text.endsWith("…")).toBe(true);
+    expect(response.text).toBe(long);
   });
 });

@@ -38,6 +38,7 @@ Vercel webhook ─서명 검증─▶ ingest ◀─────┘
 - [x] collect와 heartbeat
 - [x] 배포 실패 webhook
 - [x] Claude 요약과 평가
+- [x] Slack 명령 `/ops`(상태·수동 수집·가벼운 eval)
 - [ ] 통합 대시보드
 
 ## 개발
@@ -84,7 +85,22 @@ pnpm dev
 
 ### Slack 앱
 
-- 봇 토큰 권한: `chat:write`. 알림 채널마다 봇을 초대해야 보낼 수 있습니다.
+- 봇 토큰 권한: `chat:write`, `commands`(슬래시 명령). 알림 채널마다 봇을 초대해야 보낼 수 있습니다.
 - Interactivity Request URL: `https://<배포 주소>/api/slack/actions`
-- 환경변수: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_OWNER_USER_ID`(버튼을 누를 수 있고 P1에 멘션할 사람)
+- Slash Commands: `/ops` → Request URL `https://<배포 주소>/api/slack/commands`
+- 환경변수: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_OWNER_USER_ID`(버튼·명령을 쓸 수 있고 P1에 멘션할 사람)
 - 버튼은 ops-bot 상태만 바꿉니다. Sentry에는 쓰지 않습니다.
+
+### Slack 명령 `/ops`
+
+| 명령 | 내용 |
+|---|---|
+| `/ops status` | 마지막 자동·수동 수집(시각·결과·단계 성공 수·heartbeat), 마지막 heartbeat, 지금 수집 중인지, 미전송 알림, 오늘(KST) Claude 사용량 |
+| `/ops collect` | 지금 수집하고 알림을 보냅니다. cron과 같은 경로·같은 잠금이라 겹치면 건너뜁니다. heartbeat는 '자동 수집이 살아 있다'는 뜻이라 보내지 않습니다 |
+| `/ops eval [시나리오]` | 운영 키로 고정 시나리오를 돌립니다. 기본은 `db-timeout`(판정)과 `injection-title`(주입 내성) 2건. 하루(KST) 3회, 알림 요약 상한과 따로 셉니다. 8건 전체는 로컬 `pnpm eval` |
+| `/ops`, `/ops help` | 사용법 |
+
+- 버튼과 같은 서명 확인을 거친 뒤 `SLACK_OWNER_USER_ID`만 쓸 수 있습니다. 다른 사람은 거절 문구만 받고 아무 일도 일어나지 않습니다.
+- 3초 안에 '실행 중'을 답하고, 실제 일은 응답 뒤에 해서 결과를 `response_url`로 부른 사람에게만 보냅니다. 결과는 자동 링크를 끈 블록으로 보냅니다(모델 요약 속 URL이 링크가 되지 않게).
+- 같은 서명의 요청은 한 번만 실행합니다. 서명이 유효한 5분 안에 같은 요청이 다시 와도(재전송·재생) eval 횟수를 쓰거나 수집을 다시 돌리지 않습니다(`slack_requests`, 1시간 보관).
+- status는 collect가 실행마다 남기는 한 줄 기록(`collect_runs`, 7일 보관, 건수·단계 수만)을 읽습니다. 기록은 잠금을 푼 뒤 남기고, 5초 안에 끝나지 않으면 기다리지 않습니다.

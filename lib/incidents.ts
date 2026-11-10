@@ -25,6 +25,11 @@ const LOCK_TTL_MS = 3 * 60_000;
 const RETENTION_MS = 180 * 24 * 60 * 60_000;
 const KST_OFFSET_MS = 9 * 60 * 60_000;
 const MAX_INGEST_ATTEMPTS = 3;
+const MIGRATION_ATTEMPTS = 3;
+// /ops status가 보는 기간. 5분마다 한 줄이라 일주일이면 약 2천 줄이다.
+const RUN_RETENTION_MS = 7 * 24 * 60 * 60_000;
+// Slack 서명 유효 시간(5분)보다 넉넉히 남긴다. 그 뒤에 다시 온 요청은 서명 확인에서 거부된다.
+const SLACK_REQUEST_RETENTION_MS = 60 * 60_000;
 
 // 이 상태가 된 배포는 늦게 도착한 과거 상태로 되돌리지 않는다.
 const FINAL_DEPLOY_STATES = "'READY', 'ERROR', 'CANCELED', 'DELETED'";
@@ -36,9 +41,19 @@ export function openDb(): Client {
   return createDb();
 }
 
-/** 빠진 마이그레이션만 적용한다. collect가 실행마다 처음에 부른다(적용된 버전은 건너뜀). */
-export async function prepareDb(db: Client): Promise<void> {
-  await migrate(db);
+/**
+ * 빠진 마이그레이션만 적용한다. collect와 Slack 명령이 처음에 부른다(적용된 버전은 건너뜀).
+ * 처음 실행이 겹치면 한쪽이 '이미 있음'으로 실패한다. 다시 보면 적용된 버전은 건너뛴다.
+ */
+export async function prepareDb(db: Client, attempts = MIGRATION_ATTEMPTS): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await migrate(db);
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+    }
+  }
 }
 
 export type RelatedDeploy = {
@@ -663,17 +678,151 @@ export async function saveAnalysis(
   return result.rowsAffected > 0;
 }
 
+/** 한국 날짜(`YYYY-MM-DD`). 하루 상한은 이 날짜로 센다. */
+function kstDay(now: Date): string {
+  return new Date(now.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
 /** 하루(KST) Claude 호출 한 칸을 예약한다. 상한에 닿았으면 false. 동시에 불려도 한 칸씩만 늘어난다. */
 export async function reserveAnalysisCall(db: Client, now: Date, limit: number): Promise<boolean> {
   if (limit <= 0) return false;
-  const day = new Date(now.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
   const { rows } = await db.execute({
     sql: `INSERT INTO analysis_usage (day, calls) VALUES (?, 1)
           ON CONFLICT (day) DO UPDATE SET calls = calls + 1 WHERE calls < ?
           RETURNING calls`,
-    args: [day, limit],
+    args: [kstDay(now), limit],
   });
   return rows.length > 0;
+}
+
+export type SlackCommandName = "eval";
+
+/**
+ * Slack 명령의 하루(KST) 한 칸을 예약하고, 예약한 뒤의 횟수를 돌려준다. 상한이면 null.
+ * 알림 요약 상한과 따로 센다. 예약한 뒤 일이 실패해도 쓴 것으로 센다(비용 상한이 목적).
+ */
+export async function reserveCommandCall(
+  db: Client,
+  command: SlackCommandName,
+  now: Date,
+  limit: number,
+): Promise<number | null> {
+  if (limit <= 0) return null;
+  const { rows } = await db.execute({
+    sql: `INSERT INTO command_usage (day, command, calls) VALUES (?, ?, 1)
+          ON CONFLICT (day, command) DO UPDATE SET calls = calls + 1 WHERE calls < ?
+          RETURNING calls`,
+    args: [kstDay(now), command, limit],
+  });
+  return rows[0] ? Number(rows[0].calls) : null;
+}
+
+/**
+ * Slack 명령 요청을 처음 보면 true. 같은 id(서명)를 이미 받았으면 false다.
+ * 동시에 와도 한쪽만 true가 된다. 일을 시작하기 전에 부른다.
+ */
+export async function claimSlackRequest(db: Client, id: string, now: Date): Promise<boolean> {
+  const { rowsAffected } = await db.execute({
+    sql: "INSERT INTO slack_requests (id, seen_at) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+    args: [id, now.toISOString()],
+  });
+  return rowsAffected === 1;
+}
+
+export type RunCaller = "cron" | "slack";
+
+/** collect 실행 하나의 결과 요약. 건수·단계 수만 담고 incident 내용은 담지 않는다. */
+export type CollectRun = {
+  caller: RunCaller;
+  startedAt: string;
+  finishedAt: string;
+  status: "done" | "locked" | "failed";
+  stepsOk: number;
+  stepsTotal: number;
+  heartbeat: "sent" | "skipped" | "failed" | "disabled";
+};
+
+export async function recordRun(db: Client, run: CollectRun): Promise<void> {
+  await db.execute({
+    sql: `INSERT INTO collect_runs (caller, started_at, finished_at, status, steps_ok, steps_total, heartbeat)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    args: [run.caller, run.startedAt, run.finishedAt, run.status, run.stepsOk, run.stepsTotal, run.heartbeat],
+  });
+}
+
+/** `/ops status`에 쓰는 값. 기록은 최근 7일만 남아 있다. */
+export type OpsStatus = {
+  lastCron: CollectRun | null;
+  lastSlack: CollectRun | null;
+  // 자동 수집이 heartbeat를 마지막으로 보낸 실행의 시작 시각
+  lastHeartbeatAt: string | null;
+  // 잠금이 살아 있으면 다른 실행이 수집 중이다
+  collecting: boolean;
+  // 지금 설정된 사이트의 열린 미전송 incident
+  pending: number;
+  overdue: boolean;
+  analysisCalls: number;
+  commandCalls: Record<SlackCommandName, number>;
+};
+
+function runFrom(row: Row | undefined): CollectRun | null {
+  if (!row) return null;
+  return {
+    caller: String(row.caller) as RunCaller,
+    startedAt: String(row.started_at),
+    finishedAt: String(row.finished_at),
+    status: String(row.status) as CollectRun["status"],
+    stepsOk: Number(row.steps_ok),
+    stepsTotal: Number(row.steps_total),
+    heartbeat: String(row.heartbeat) as CollectRun["heartbeat"],
+  };
+}
+
+const LATEST_RUN = `SELECT caller, started_at, finished_at, status, steps_ok, steps_total, heartbeat
+                    FROM collect_runs WHERE caller = ? ORDER BY started_at DESC, id DESC LIMIT 1`;
+
+/** 상태를 읽기 한 번(batch)으로 모은다. */
+export async function readOpsStatus(
+  db: Client,
+  { now, lockName, targetIds }: { now: Date; lockName: string; targetIds: readonly string[] },
+): Promise<OpsStatus> {
+  // 설정된 사이트가 없으면 아무 행도 맞지 않게 한다.
+  const scope = targetIds.length > 0 ? `AND target IN (${placeholders(targetIds)})` : "AND 0";
+  const day = kstDay(now);
+  const [cron, slack, heartbeat, lock, pending, analysis, commands] = await db.batch(
+    [
+      { sql: LATEST_RUN, args: ["cron"] },
+      { sql: LATEST_RUN, args: ["slack"] },
+      {
+        sql: `SELECT MAX(started_at) AS at FROM collect_runs WHERE caller = 'cron' AND heartbeat = 'sent'`,
+        args: [],
+      },
+      { sql: "SELECT 1 FROM locks WHERE name = ? AND expires_at > ?", args: [lockName, now.toISOString()] },
+      {
+        sql: `SELECT COUNT(*) AS n, COALESCE(SUM(pending_since <= ?), 0) AS overdue FROM incidents
+              WHERE status = 'open' AND notified_at IS NULL ${scope}`,
+        args: [isoBefore(now, DELIVERY_OVERDUE_MS), ...targetIds],
+      },
+      { sql: "SELECT calls FROM analysis_usage WHERE day = ?", args: [day] },
+      { sql: "SELECT command, calls FROM command_usage WHERE day = ?", args: [day] },
+    ],
+    "read",
+  );
+  const commandCalls: Record<SlackCommandName, number> = { eval: 0 };
+  for (const row of commands.rows) {
+    if (String(row.command) === "eval") commandCalls.eval = Number(row.calls);
+  }
+  const lastHeartbeat = heartbeat.rows[0]?.at;
+  return {
+    lastCron: runFrom(cron.rows[0]),
+    lastSlack: runFrom(slack.rows[0]),
+    lastHeartbeatAt: lastHeartbeat == null ? null : String(lastHeartbeat),
+    collecting: lock.rows.length > 0,
+    pending: Number(pending.rows[0]?.n ?? 0),
+    overdue: Number(pending.rows[0]?.overdue ?? 0) > 0,
+    analysisCalls: Number(analysis.rows[0]?.calls ?? 0),
+    commandCalls,
+  };
 }
 
 /** 같은 시각 다른 사이트에도 에러가 있었는지. incident는 합치지 않고 메시지에만 표시한다. */
@@ -794,6 +943,9 @@ export async function purgeExpired(db: Client, now: Date): Promise<void> {
       { sql: "DELETE FROM mutes WHERE until < ?", args: [cutoff] },
       { sql: "DELETE FROM locks WHERE expires_at < ?", args: [now.toISOString()] },
       { sql: "DELETE FROM analysis_usage WHERE day < ?", args: [cutoff.slice(0, 10)] },
+      { sql: "DELETE FROM command_usage WHERE day < ?", args: [cutoff.slice(0, 10)] },
+      { sql: "DELETE FROM collect_runs WHERE started_at < ?", args: [isoBefore(now, RUN_RETENTION_MS)] },
+      { sql: "DELETE FROM slack_requests WHERE seen_at < ?", args: [isoBefore(now, SLACK_REQUEST_RETENTION_MS)] },
     ],
     "write",
   );

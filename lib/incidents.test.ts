@@ -7,6 +7,7 @@ import { createDb, migrate } from "./db";
 import {
   acquireLock,
   claimNotification,
+  claimSlackRequest,
   claimPending,
   completeNotification,
   completeNotifications,
@@ -21,14 +22,18 @@ import {
   listPending,
   muteIncident,
   purgeExpired,
+  readOpsStatus,
   recordDeploys,
+  recordRun,
   releaseClaim,
   releaseLock,
   releaseNotification,
   reserveAnalysisCall,
+  reserveCommandCall,
   resolveIncident,
   saveAnalysis,
   saveCursor,
+  type CollectRun,
   type Incident,
   type StoredAnalysis,
 } from "./incidents";
@@ -947,6 +952,7 @@ describe("incidents", () => {
       await muteIncident(db, "site-a", "sentry:9", OLD, OLD);
       await acquireLock(db, "collect", "run-1", OLD);
       await reserveAnalysisCall(db, OLD, 50);
+      await reserveCommandCall(db, "eval", OLD, 3);
 
       await purgeExpired(db, NOW);
 
@@ -955,6 +961,36 @@ describe("incidents", () => {
       expect(await count("mutes")).toBe(0);
       expect(await count("locks")).toBe(0);
       expect(await count("analysis_usage")).toBe(0);
+      expect(await count("command_usage")).toBe(0);
+    });
+
+    it("받은 Slack 요청은 1시간만 남긴다", async () => {
+      await claimSlackRequest(db, "v0=old", new Date("2027-05-31T22:59:00.000Z"));
+      await claimSlackRequest(db, "v0=new", new Date("2027-05-31T23:01:00.000Z"));
+
+      await purgeExpired(db, NOW);
+
+      const { rows } = await db.execute("SELECT id FROM slack_requests");
+      expect(rows.map((r) => r.id)).toEqual(["v0=new"]);
+    });
+
+    it("실행 기록은 7일만 남긴다", async () => {
+      const run = (startedAt: string): CollectRun => ({
+        caller: "cron",
+        startedAt,
+        finishedAt: startedAt,
+        status: "done",
+        stepsOk: 1,
+        stepsTotal: 1,
+        heartbeat: "sent",
+      });
+      await recordRun(db, run("2027-05-24T23:59:00.000Z"));
+      await recordRun(db, run("2027-05-25T00:01:00.000Z"));
+
+      await purgeExpired(db, NOW);
+
+      const { rows } = await db.execute("SELECT started_at FROM collect_runs");
+      expect(rows.map((r) => r.started_at)).toEqual(["2027-05-25T00:01:00.000Z"]);
     });
 
     it("열린 incident와 최근 행은 남긴다", async () => {
@@ -963,6 +999,7 @@ describe("incidents", () => {
       await muteIncident(db, "site-a", "sentry:9", new Date("2027-05-30T00:00:00.000Z"), NOW);
       await acquireLock(db, "collect", "run-1", NOW);
       await reserveAnalysisCall(db, NOW, 50);
+      await reserveCommandCall(db, "eval", NOW, 3);
 
       await purgeExpired(db, NOW);
 
@@ -971,6 +1008,7 @@ describe("incidents", () => {
       expect(await count("mutes")).toBe(1);
       expect(await count("locks")).toBe(1);
       expect(await count("analysis_usage")).toBe(1);
+      expect(await count("command_usage")).toBe(1);
     });
   });
 
@@ -1034,6 +1072,114 @@ describe("incidents", () => {
         ["2026-11-07", 1],
         ["2026-11-08", 1],
       ]);
+    });
+  });
+
+  describe("Slack 명령 사용량·실행 기록·상태", () => {
+    const run = (overrides: Partial<CollectRun> = {}): CollectRun => ({
+      caller: "cron",
+      startedAt: iso("01:00"),
+      finishedAt: iso("01:01"),
+      status: "done",
+      stepsOk: 4,
+      stepsTotal: 4,
+      heartbeat: "sent",
+      ...overrides,
+    });
+    const status = (now: Date, targetIds: readonly string[] = ["site-a"]) =>
+      readOpsStatus(db, { now, lockName: "collect", targetIds });
+
+    it("명령 칸을 예약하면 예약한 뒤의 횟수를, 상한이면 null을 돌려준다. 동시에 불려도 넘지 않는다", async () => {
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => reserveCommandCall(db, "eval", at("01:00"), 3)),
+      );
+      expect(results.filter((n) => n !== null).sort()).toEqual([1, 2, 3]);
+      expect(await reserveCommandCall(db, "eval", at("02:00"), 3)).toBeNull();
+      expect(await reserveCommandCall(db, "eval", at("02:00"), 0)).toBeNull();
+    });
+
+    it("명령 칸은 알림 요약 칸과 따로 세고, 한국 자정(UTC 15시)에 새로 시작한다", async () => {
+      expect(await reserveCommandCall(db, "eval", new Date("2026-11-07T14:59:00.000Z"), 1)).toBe(1);
+      expect(await reserveCommandCall(db, "eval", new Date("2026-11-07T14:59:30.000Z"), 1)).toBeNull();
+      expect(await reserveCommandCall(db, "eval", new Date("2026-11-07T15:00:00.000Z"), 1)).toBe(1);
+      expect(await reserveAnalysisCall(db, new Date("2026-11-07T14:59:00.000Z"), 1)).toBe(true);
+
+      const next = await status(new Date("2026-11-07T15:30:00.000Z"));
+      expect(next.commandCalls).toEqual({ eval: 1 });
+      expect(next.analysisCalls).toBe(0);
+      const before = await status(new Date("2026-11-07T14:59:59.000Z"));
+      expect(before.commandCalls).toEqual({ eval: 1 });
+      expect(before.analysisCalls).toBe(1);
+    });
+
+    it("같은 Slack 요청은 처음 한 번만 받는다. 동시에 와도 하나만 받는다", async () => {
+      const results = await Promise.all(
+        Array.from({ length: 4 }, () => claimSlackRequest(db, "v0=abc", at("01:00"))),
+      );
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(await claimSlackRequest(db, "v0=abc", at("01:04"))).toBe(false);
+      expect(await claimSlackRequest(db, "v0=def", at("01:04"))).toBe(true);
+    });
+
+    it("기록이 없으면 빈 상태를 돌려준다", async () => {
+      expect(await status(at("01:00"))).toEqual({
+        lastCron: null,
+        lastSlack: null,
+        lastHeartbeatAt: null,
+        collecting: false,
+        pending: 0,
+        overdue: false,
+        analysisCalls: 0,
+        commandCalls: { eval: 0 },
+      });
+    });
+
+    it("호출자별 마지막 실행과 heartbeat를 마지막으로 보낸 자동 수집 시각을 돌려준다", async () => {
+      await recordRun(db, run({ startedAt: iso("00:50"), heartbeat: "sent" }));
+      await recordRun(db, run({ startedAt: iso("00:55"), heartbeat: "skipped", stepsOk: 3 }));
+      await recordRun(db, run({ caller: "slack", startedAt: iso("00:57"), heartbeat: "disabled" }));
+      // 늦게 끝나 나중에 기록된 실행도 시작 시각으로 줄 세운다
+      await recordRun(
+        db,
+        run({ caller: "slack", startedAt: iso("00:53"), status: "locked", stepsOk: 0, stepsTotal: 0, heartbeat: "skipped" }),
+      );
+
+      const current = await status(at("01:00"));
+      expect(current.lastCron).toEqual(run({ startedAt: iso("00:55"), heartbeat: "skipped", stepsOk: 3 }));
+      expect(current.lastSlack).toMatchObject({ caller: "slack", startedAt: iso("00:57"), status: "done" });
+      expect(current.lastHeartbeatAt).toBe(iso("00:50"));
+    });
+
+    it("수동 실행은 heartbeat 시각으로 세지 않는다", async () => {
+      await recordRun(db, run({ caller: "slack", startedAt: iso("00:58"), heartbeat: "sent" }));
+      expect((await status(at("01:00"))).lastHeartbeatAt).toBeNull();
+    });
+
+    it("기록할 수 없는 값은 표가 거부한다", async () => {
+      await expect(recordRun(db, run({ caller: "manual" as CollectRun["caller"] }))).rejects.toThrow(/CHECK/);
+      await expect(recordRun(db, run({ heartbeat: "ok" as CollectRun["heartbeat"] }))).rejects.toThrow(/CHECK/);
+    });
+
+    it("잠금이 살아 있을 때만 수집 중으로 본다", async () => {
+      await acquireLock(db, "collect", "run-1", at("01:00"));
+      expect((await status(at("01:01"))).collecting).toBe(true);
+      // TTL 3분
+      expect((await status(at("01:03"))).collecting).toBe(false);
+      await releaseLock(db, "collect", "run-1");
+      expect((await status(at("01:01"))).collecting).toBe(false);
+    });
+
+    it("미전송 알림은 넘긴 사이트만 세고, 15분 넘게 기다린 것이 있으면 표시한다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await ingest(db, OTHER, [issue({ target: "site-b" })], at("01:00"));
+
+      expect(await status(at("01:14"))).toMatchObject({ pending: 1, overdue: false });
+      expect(await status(at("01:15"))).toMatchObject({ pending: 1, overdue: true });
+      expect(await status(at("01:15"), ["site-a", "site-b"])).toMatchObject({ pending: 2, overdue: true });
+      expect(await status(at("01:15"), [])).toMatchObject({ pending: 0, overdue: false });
+
+      await deliver(at("01:16"));
+      expect(await status(at("01:16"))).toMatchObject({ pending: 0, overdue: false });
     });
   });
 });

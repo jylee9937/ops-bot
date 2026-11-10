@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDb } from "@/lib/__fixtures__/test-db";
 import { getIncident, ingest } from "@/lib/incidents";
 import { maskLogMessage, tagOf } from "@/lib/mask";
+import { ephemeral } from "@/lib/slack";
 import type { Target } from "@/lib/targets";
 
 // after()는 요청 밖에서 부를 수 없다. 응답 뒤 작업을 모아 두었다가 직접 실행한다.
@@ -141,16 +142,7 @@ describe("POST /api/slack/actions", () => {
 
     await runDeferred();
     expect((await getIncident(db.db, 1))?.status).toBe("open");
-    expect(responses).toEqual([
-      {
-        url: RESPONSE_URL,
-        body: {
-          response_type: "ephemeral",
-          replace_original: false,
-          text: "이 버튼은 담당자만 누를 수 있습니다.",
-        },
-      },
-    ]);
+    expect(responses).toEqual([{ url: RESPONSE_URL, body: ephemeral("이 버튼은 담당자만 누를 수 있습니다.") }]);
   });
 
   it("링크 버튼은 200만 돌려준다", async () => {

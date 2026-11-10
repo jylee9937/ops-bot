@@ -1,5 +1,5 @@
 import type { Client } from "@libsql/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Anthropic from "@anthropic-ai/sdk";
 import { createTestDb } from "./__fixtures__/test-db";
 import { DAILY_ANALYSIS_LIMIT, type ClaudeClient } from "./analysis";
@@ -52,6 +52,25 @@ function deployment(id: string, state: string) {
     inspectorUrl: `https://vercel.com/team/project/${id}`,
     meta: { githubCommitSha: "abcdef0" },
   };
+}
+
+/** `method`에 넘긴 문장에 `match`가 들어 있으면 실패하거나(기본) 끝나지 않는 DB. 나머지는 그대로 통과시킨다. */
+function failingDb(db: Client, method: "batch" | "execute", match: string, mode: "reject" | "hang" = "reject"): Client {
+  return new Proxy(db, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property === method) {
+        return async (...args: unknown[]) => {
+          if (JSON.stringify(args[0]).includes(match)) {
+            if (mode === "hang") return new Promise(() => {});
+            throw new Error("db down");
+          }
+          return (value as (...rest: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 /** 주소로 Sentry·Vercel·Slack·heartbeat를 구분해 응답하는 가짜 세상. */
@@ -456,6 +475,90 @@ describe("runCollect", () => {
     expect(result.steps[0].reason).toBe("network");
     expect(result.heartbeat).toBe("skipped");
     expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
+  });
+
+  describe("실행 기록(/ops status)", () => {
+    const runs = async () => {
+      const { rows } = await db.execute(
+        "SELECT caller, started_at, finished_at, status, steps_ok, steps_total, heartbeat FROM collect_runs ORDER BY id",
+      );
+      return rows.map((r) => ({
+        caller: r.caller,
+        startedAt: r.started_at,
+        finishedAt: r.finished_at,
+        status: r.status,
+        stepsOk: Number(r.steps_ok),
+        stepsTotal: Number(r.steps_total),
+        heartbeat: r.heartbeat,
+      }));
+    };
+
+    it("자동 수집은 시작·끝 시각, 결과, 성공한 단계 수, heartbeat를 남긴다", async () => {
+      w.state.sentryIssues = [sentryIssue("101")];
+      w.state.fail.vercel = 500;
+      let tick = 0;
+      await runCollect(deps("01:00", { now: () => new Date(at("01:00").getTime() + 1_000 * tick++) }));
+
+      expect(await runs()).toEqual([
+        {
+          caller: "cron",
+          startedAt: at("01:00").toISOString(),
+          finishedAt: expect.not.stringMatching(/^2026-11-09T01:00:00\.000Z$/),
+          status: "done",
+          stepsOk: 3,
+          stepsTotal: 4,
+          heartbeat: "skipped",
+        },
+      ]);
+    });
+
+    it("Slack에서 부른 실행은 caller를 slack으로 남긴다", async () => {
+      await runCollect(deps("01:00", { caller: "slack", heartbeatUrl: null }));
+      expect(await runs()).toMatchObject([{ caller: "slack", status: "done", heartbeat: "disabled" }]);
+      expect(w.calls).not.toContain("heartbeat");
+    });
+
+    it("잠금에 막힌 실행도 남긴다", async () => {
+      await acquireLock(db, "collect", "other-run", at("01:00"));
+      await runCollect(deps("01:01"));
+      expect(await runs()).toMatchObject([{ status: "locked", stepsOk: 0, stepsTotal: 0, heartbeat: "skipped" }]);
+    });
+
+    it("중간에 실패하면 failed로 남기고 잠금을 푼다", async () => {
+      // 보관 기간 정리(purgeExpired)에서 실패하게 한다
+      await expect(
+        runCollect(deps("01:00", { db: failingDb(db, "batch", "DELETE FROM incidents") })),
+      ).rejects.toThrow("db down");
+
+      expect(await runs()).toMatchObject([{ caller: "cron", status: "failed", stepsTotal: 4 }]);
+      expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
+    });
+
+    it("[리뷰 P2-2] 기록이 끝나지 않아도 잠금을 풀고 결과를 돌려준다", async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const hanging = failingDb(db, "execute", "INSERT INTO collect_runs", "hang");
+        const result = await runCollect(deps("01:00", { db: hanging, recordTimeoutMs: 20 }));
+        expect(result.status).toBe("done");
+        expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
+        expect(errors).toHaveBeenCalledWith("[collect] 실행 기록 실패: timeout");
+      } finally {
+        errors.mockRestore();
+      }
+    }, 2_000);
+
+    it("기록이 실패해도 수집 결과는 그대로 돌려준다", async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const result = await runCollect(deps("01:00", { db: failingDb(db, "execute", "INSERT INTO collect_runs") }));
+        expect(result.status).toBe("done");
+        expect(result.heartbeat).toBe("sent");
+        expect(errors).toHaveBeenCalledWith("[collect] 실행 기록 실패: internal");
+        expect(await runs()).toEqual([]);
+      } finally {
+        errors.mockRestore();
+      }
+    });
   });
 
   describe("Claude 요약", () => {
