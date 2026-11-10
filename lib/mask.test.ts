@@ -92,13 +92,28 @@ describe("maskRoute", () => {
     ["경로 뒤 설명", "GET /api/playback token abc", "GET /api/playback"],
     ["in 함수 뒤 설명", "app/api/x/route.ts in GET (secret value)", "app/api/x/route.ts in GET"],
     ["경로 속 토큰", "/auth/confirm/eyJhbGciOiJIUzI1NiJ9x1y2z3a4b5c6d7e8f9", "/auth/confirm/[숨김]"],
-    ["허용하지 않는 글자로 시작", "Authorization: Bearer abc", "Authorization"],
+    ["허용하지 않는 글자로 시작", "Authorization: Bearer abc", "Authorization:"],
+    ["보이지 않는 문자가 낀 이메일", "/u/kim​lee@example.com", "/u/[이메일]"],
+    ["띄어 쓴 전화번호", "/call/010 1234 5678", "/call/[전화번호]"],
+    ["인코딩된 이메일", "/users/kim%40example.com/edit", "/users/[이메일]/edit"],
+    ["익명 함수", "Object.<anonymous>(src/a.ts)", "Object.<anonymous>(src/a.ts)"],
+    ["콜론 매개변수", "GET /users/:id", "GET /users/:id"],
+    ["중괄호 매개변수", "/api/users/{user_id}", "/api/users/{user_id}"],
+    ["라우트 그룹 파일", "app/(main)/lectures/[id]/page.tsx in render", "app/(main)/lectures/[id]/page.tsx in render"],
+    ["이어 붙인 괄호 묶음", "listArticles(src/a.ts)(Bearer_fake-e2e-key)", "listArticles(src/a.ts)"],
   ])("%s", (_name, raw, expected) => {
     expect(maskRoute(raw)).toBe(expected);
   });
 });
 
 describe("maskFrame", () => {
+  it("보이지 않는 문자로 끊은 이메일도 숨긴다", () => {
+    const masked = maskFrame({ filename: "src/kim​lee@example.com.ts", function: "a​b", line: 1 });
+    expect(masked.filename).not.toContain("kim");
+    expect(masked.filename).toContain("[이메일]");
+    expect(masked.function).toBe("ab");
+  });
+
   it("파일·함수·줄만 남긴다", () => {
     const frame = {
       filename: "app:///_next/server/app.js?dpl=abc",

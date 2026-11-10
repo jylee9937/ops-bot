@@ -30,8 +30,9 @@ const MOBILE = /(?<!\d)(?:\+?82[-.\s]?)?0?1[016789][-.\s]?\d{3,4}[-.\s]?\d{4}(?!
 const LANDLINE = /(?<!\d)0\d{1,2}[-.\s]\d{3,4}[-.\s]\d{4}(?!\d)/g;
 const LONG_NUMBER = /(?<!\d)\d(?:[-.\s]?\d){9,}(?!\d)/g;
 
+// 보이지 않는 문자는 자르기 전에 지운다. 남겨 두면 그 앞에서 잘린 이메일 조각이 정규식을 빠져나간다.
 function firstLine(raw: string): string {
-  return raw.slice(0, MAX_INPUT).trimStart().split(LINE_BREAK, 1)[0];
+  return raw.slice(0, MAX_INPUT).replace(/\p{Cf}/gu, "").trimStart().split(LINE_BREAK, 1)[0];
 }
 
 function beforeColon(text: string): string {
@@ -42,18 +43,23 @@ function withoutUrlParts(text: string): string {
   return text.replace(URL_ORIGIN, "").split(/[?#]/, 1)[0];
 }
 
-// 정규식을 먼저 돌리고 나서 자른다. 반대로 하면 잘린 이메일이 정규식을 빠져나간다.
-function finish(text: string, fallback: string): MaskedText {
-  const scrubbed = text
+// 개인정보를 숨기고 공백을 정리한다. %40은 인코딩된 @라 먼저 되돌린다.
+function scrub(text: string): string {
+  return text
     .replace(/\p{Cf}/gu, "")
     .replace(/\p{Cc}/gu, " ")
+    .replace(/%40/gi, "@")
     .replace(EMAIL, "[이메일]")
     .replace(MOBILE, "[전화번호]")
     .replace(LANDLINE, "[전화번호]")
     .replace(LONG_NUMBER, "[숫자]")
     .replace(/\s+/g, " ")
     .trim();
-  return Array.from(scrubbed || fallback)
+}
+
+// 정규식을 먼저 돌리고 나서 자른다. 반대로 하면 잘린 이메일이 정규식을 빠져나간다.
+function finish(text: string, fallback: string): MaskedText {
+  return Array.from(scrub(text) || fallback)
     .slice(0, MAX_LENGTH)
     .join("")
     .trimEnd() as MaskedText;
@@ -86,16 +92,23 @@ function withoutTokens(text: string): string {
 }
 
 const HTTP_METHOD = /^(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) (?=\/)/;
-// 경로·파일·`함수(파일)`에 쓰는 글자. 공백이 없으니 뒤에 붙은 설명·값은 여기서 끊긴다.
-const ROUTE_PATH = /^[\p{L}\p{N}_$./@~+\-[\]()%]{1,200}/u;
+// 경로·파일·함수 이름에 쓰는 글자(`:id`·`{id}`·`[id]`·`<anonymous>` 포함). 공백·괄호는 없다.
+const ROUTE_CHAR = String.raw`[\p{L}\p{N}_$./@~+\-[\]%:{}<>]`;
+// 괄호 묶음은 뒤에 글자가 이어지는 것(`app/(main)/page.tsx`)과 맨 끝 하나(`함수(파일)`)만 받는다.
+// `함수(파일)(꼬리)`처럼 이어 붙인 두 번째 묶음은 버린다.
+const ROUTE_PATH = new RegExp(
+  String.raw`^${ROUTE_CHAR}*(?:\(${ROUTE_CHAR}*\)${ROUTE_CHAR}+)*(?:\(${ROUTE_CHAR}*\))?`,
+  "u",
+);
 
 /**
  * Sentry culprit에서 사이트 주소와 쿼리·해시를 떼고, culprit이 실제로 쓰는 꼴만 남긴다:
  * `METHOD /경로`, `/경로`, `함수(파일)`, `파일 in 함수`. 그 뒤의 꼬리는 버린다.
  * culprit은 Slack과 Claude로 가는데 위조된 이벤트는 여기에 아무 글이나 넣을 수 있다.
+ * 개인정보는 자르기 전에 숨긴다(`[이메일]` 같은 표시는 허용 글자라 남는다).
  */
 export function maskRoute(raw: string): MaskedText {
-  const text = withoutUrlParts(firstLine(raw)).trim();
+  const text = scrub(withoutUrlParts(firstLine(raw)));
   const method = HTTP_METHOD.exec(text)?.[0] ?? "";
   const rest = text.slice(method.length);
   const path = ROUTE_PATH.exec(rest)?.[0] ?? "";
