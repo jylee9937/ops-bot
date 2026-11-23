@@ -133,13 +133,33 @@ export const SYSTEM_PROMPT = [
   "판단 기준:",
   "- relatedDeploy는 에러가 시작되기 전 30분 안에 공개된 배포입니다(시각이 가깝다는 뜻일 뿐 원인이라는 뜻은 아님). 에러가 코드 변경으로 설명되면 deployRelated=true, 외부 서비스 장애처럼 코드와 무관해 보이면 false. relatedDeploy가 없으면 false.",
   "- otherSitesWithErrors가 있고 공용 플랫폼(호스팅·DB 서비스) 문제로 보이면 crossSite=true, suspectedLayer는 대개 플랫폼.",
+  "- 근거의 시각(firstSeen·lastSeen·relatedDeploy.liveAt)은 한국 시간(KST)입니다. 글에 시각을 적을 때는 이 값을 그대로 쓰고 다른 시간대로 바꾸지 마세요.",
   "- 근거에 없는 사실(원인 코드, 사용자 수, 시각)을 지어내지 마세요. 근거가 부족하면 confidence를 낮추세요.",
   "- 모든 문장은 한국어로 짧게 쓰고, 개인정보로 보이는 값은 적지 마세요.",
 ].join("\n");
 
+const KST_OFFSET_MS = 9 * 60 * 60_000;
+
+/**
+ * `2026-11-10 22:08 KST`. 알림 본문(KST)과 같은 시각을 쓰게 한다.
+ * UTC ISO를 그대로 넘기면 모델이 `13:08`처럼 UTC 시각을 옮겨 적는다(11-12 Preview에서 확인).
+ */
+function kstText(iso: string): string {
+  const time = Date.parse(iso);
+  if (Number.isNaN(time)) return iso;
+  const kst = new Date(time + KST_OFFSET_MS).toISOString();
+  return `${kst.slice(0, 10)} ${kst.slice(11, 16)} KST`;
+}
+
 /** 근거를 데이터 블록으로 만든다. `<`·`>`는 유니코드 이스케이프로 바꿔 블록을 닫는 글자가 섞이지 않게 한다. */
 export function userPrompt(input: AnalysisInput): string {
-  const json = JSON.stringify(input, null, 2).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  const data: AnalysisInput = {
+    ...input,
+    firstSeen: kstText(input.firstSeen),
+    lastSeen: kstText(input.lastSeen),
+    relatedDeploy: input.relatedDeploy && { ...input.relatedDeploy, liveAt: kstText(input.relatedDeploy.liveAt) },
+  };
+  const json = JSON.stringify(data, null, 2).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
   return `<incident>\n${json}\n</incident>\n위 incident를 분석해 주세요.`;
 }
 

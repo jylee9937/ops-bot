@@ -49,6 +49,11 @@ function input(overrides: Partial<AnalysisInput> = {}): AnalysisInput {
   };
 }
 
+/** `<incident>` 블록 안의 JSON. */
+function promptJson(prompt: string) {
+  return JSON.parse(prompt.slice(prompt.indexOf("\n") + 1, prompt.lastIndexOf("\n</incident>")));
+}
+
 type Response = { stop_reason: string; model?: string; content: { type: string; text?: string }[] };
 
 /** Claude API 대신 응답·오류를 돌려주는 가짜 클라이언트. 보낸 요청을 기록한다. */
@@ -77,6 +82,39 @@ describe("analysis", () => {
       expect(prompt).toContain("\\u003c/incident\\u003e");
       const json = prompt.slice(prompt.indexOf("\n") + 1, prompt.lastIndexOf("\n</incident>"));
       expect(JSON.parse(json).title).toBe(title);
+    });
+
+    it("시각을 KST로 넘기고 시스템 프롬프트에 KST라고 알린다", () => {
+      const prompt = userPrompt(
+        input({
+          firstSeen: "2026-11-10T13:21:00.000Z",
+          lastSeen: "2026-11-10T15:30:59.999Z",
+          relatedDeploy: { liveAt: "2026-11-10T13:08:00.000Z", sha: "0e4d97b" },
+        }),
+      );
+      const json = promptJson(prompt);
+
+      expect(json.firstSeen).toBe("2026-11-10 22:21 KST");
+      // 자정을 넘으면 날짜도 바뀐다
+      expect(json.lastSeen).toBe("2026-11-11 00:30 KST");
+      expect(json.relatedDeploy).toEqual({ liveAt: "2026-11-10 22:08 KST", sha: "0e4d97b" });
+      expect(prompt).not.toMatch(/\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+      expect(SYSTEM_PROMPT).toContain("한국 시간(KST)");
+    });
+
+    it("배포가 없으면 relatedDeploy는 그대로 null이다", () => {
+      expect(promptJson(userPrompt(input())).relatedDeploy).toBeNull();
+    });
+
+    it("읽을 수 없는 시각은 그대로 넘기고, 입력의 UTC 값은 바꾸지 않는다", () => {
+      const deploy = Object.freeze({ liveAt: "2026-11-10T13:08:00.000Z", sha: "0e4d97b" });
+      const original = Object.freeze(input({ firstSeen: "not-a-date", relatedDeploy: deploy }));
+
+      const json = promptJson(userPrompt(original));
+
+      expect(json.firstSeen).toBe("not-a-date");
+      expect(original.lastSeen).toBe("2026-11-07T01:00:00.000Z");
+      expect(original.relatedDeploy?.liveAt).toBe("2026-11-10T13:08:00.000Z");
     });
 
     it("시스템 프롬프트는 입력을 지시가 아닌 데이터로 다루라고 한다", () => {
