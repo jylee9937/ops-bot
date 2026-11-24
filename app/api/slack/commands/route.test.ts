@@ -219,7 +219,7 @@ describe("POST /api/slack/commands", () => {
       await POST(signedRequest(command("collect")));
       await runDeferred();
 
-      expect(resultText()).toContain("*수집 완료* · 단계 2/2 성공");
+      expect(resultText()).toContain("*수집 완료* · 단계 3/3 성공");
       expect(requests).not.toContain("heartbeat");
       const { rows } = await db.db.execute("SELECT caller, heartbeat FROM collect_runs");
       expect(rows.map((r) => [r.caller, r.heartbeat])).toEqual([["slack", "disabled"]]);

@@ -238,7 +238,7 @@ describe("collectReport", () => {
       { target: "site-x", step: "slack", ok: false, reason: "auth" },
     ],
     ingested: { created: 1, updated: 2, reopened: 3, escalated: 4, resolved: 5, ignored: 6 },
-    delivered: { detailed: 1, bundled: 2, skipped: 3, analyzed: 4, analysisFailed: 5 },
+    delivered: { detailed: 1, bundled: 2, skipped: 3, analyzed: 4, analysisFailed: 5, updated: 6 },
     heartbeat: "disabled",
   };
 
@@ -249,7 +249,7 @@ describe("collectReport", () => {
         "*수집 완료* · 단계 1/3 성공 · heartbeat는 수동 실행이라 보내지 않음",
         "• 실패 단계: &lt;!here&gt; 사이트 Sentry(timeout), site-x Slack 전송(auth)",
         "• incident: 새로 1 · 갱신 2 · 재개방 3 · 등급 상승 4 · 해결 5 · 무시 6",
-        "• 알림: 상세 1 · 묶음 2 · 건너뜀 3 · Claude 요약 4(실패 5)",
+        "• 알림: 상세 1 · 묶음 2 · 건너뜀 3 · Claude 요약 4(실패 5) · 자동 해결로 고친 메시지 6",
       ].join("\n"),
     );
   });
@@ -383,7 +383,7 @@ describe("runOpsCommand", () => {
   it("collect: cron과 같은 경로로 수집하되 heartbeat는 보내지 않고 slack 실행으로 남긴다", async () => {
     const text = await runOpsCommand({ kind: "collect" }, env(), rid(), deps());
 
-    expect(text).toContain("*수집 완료* · 단계 2/2 성공");
+    expect(text).toContain("*수집 완료* · 단계 3/3 성공");
     expect(requests).toEqual(["api.vercel.com"]);
     const { rows } = await db.db.execute("SELECT caller, status, heartbeat FROM collect_runs");
     expect(rows.map((r) => [r.caller, r.status, r.heartbeat])).toEqual([["slack", "done", "disabled"]]);

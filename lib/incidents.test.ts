@@ -8,6 +8,7 @@ import {
   acquireLock,
   claimNotification,
   claimSlackRequest,
+  clearResolveNotice,
   claimPending,
   completeNotification,
   completeNotifications,
@@ -19,6 +20,7 @@ import {
   isDeliveryOverdue,
   listOpenSentryIncidents,
   listClaimed,
+  listResolveNotices,
   listPending,
   muteIncident,
   purgeExpired,
@@ -1180,6 +1182,121 @@ describe("incidents", () => {
 
       await deliver(at("01:16"));
       expect(await status(at("01:16"))).toMatchObject({ pending: 0, overdue: false });
+    });
+  });
+
+  describe("자동 해결 표시(Slack 메시지 고치기)", () => {
+    const CHANNEL = "C0OPSA1";
+    const deliverTo = async (now: Date, channel: string | null, fingerprint = "sentry:1", slackTs = "111.222") => {
+      const { id } = await row(fingerprint);
+      const claim = await claimNotification(db, id, now);
+      if (!claim) throw new Error("전송을 시작할 수 없습니다");
+      return completeNotification(db, id, claim, slackTs, now, channel);
+    };
+
+    it("상세 메시지의 채널 id를 남기고, 자동으로 닫으면 이유를 남긴다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      expect(await row()).toMatchObject({ slackTs: "111.222", slackChannel: CHANNEL, resolveNotice: null });
+
+      expect(await resolveIncident(db, "site-a", "sentry:1", at("01:10"), 1, "sentry_resolved")).toBe(true);
+      expect(await row()).toMatchObject({ status: "resolved", resolveNotice: "sentry_resolved" });
+      expect((await listResolveNotices(db, "site-a", 10, at("02:00"))).map((incident) => incident.fingerprint)).toEqual(["sentry:1"]);
+      expect(await listResolveNotices(db, "site-b", 10, at("02:00"))).toEqual([]);
+    });
+
+    it("버튼으로 닫으면(이유 없음) 표시를 남기지 않는다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      await resolveIncident(db, "site-a", "sentry:1", at("01:10"), 1);
+      expect((await row()).resolveNotice).toBeNull();
+    });
+
+    it("보낸 적 없거나 채널 id를 모르면 고칠 메시지가 없어 표시를 남기지 않는다", async () => {
+      await ingest(db, TARGET, [issue(), issue({ fingerprint: "sentry:2", sourceId: "2" })], at("01:00"));
+      await deliverTo(at("01:00"), null, "sentry:2");
+      await resolveIncident(db, "site-a", "sentry:1", at("01:10"), 1, "sentry_resolved");
+      await resolveIncident(db, "site-a", "sentry:2", at("01:10"), 1, "sentry_resolved");
+      expect((await row("sentry:1")).resolveNotice).toBeNull();
+      expect((await row("sentry:2")).resolveNotice).toBeNull();
+    });
+
+    it("묶음 메시지로 보내면 채널 id를 비운다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      // 크게 늘어 등급이 올랐고, 다시 알릴 때 묶음으로 나갔다
+      expect((await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:04") })], at("01:05"))).escalated).toBe(1);
+      const { claim, incidents } = await claimPending(db, "site-a", at("01:05"));
+      expect(await completeNotifications(db, incidents.map(({ id }) => id), claim, "333.444", at("01:05"))).toBe(1);
+      expect(await row()).toMatchObject({ slackTs: "333.444", slackChannel: null });
+    });
+
+    it.each([
+      ["issue.resolved", "sentry_resolved"],
+      ["issue.ignored", "sentry_ignored"],
+    ] as const)("Sentry 수집에서 %s를 받아 닫으면 %s를 남긴다", async (kind, notice) => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      await ingest(db, TARGET, [issue({ kind, lastSeen: iso("01:04") })], at("01:05"));
+      expect(await row()).toMatchObject({ status: "resolved", resolveNotice: notice });
+    });
+
+    it("다시 열리면 지난 메시지의 채널 id와 표시를 지운다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      await resolveIncident(db, "site-a", "sentry:1", at("01:10"), 1, "sentry_resolved");
+      await ingest(db, TARGET, [issue({ kind: "issue.regressed", count: 2, lastSeen: iso("01:12") })], at("01:15"));
+      expect(await row()).toMatchObject({ episode: 2, slackTs: null, slackChannel: null, resolveNotice: null });
+      expect(await listResolveNotices(db, "site-a", 10, at("02:00"))).toEqual([]);
+    });
+
+    it("읽은 뒤 다시 열려 새 회차가 닫혔으면 새 표시를 지우지 않는다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      await resolveIncident(db, "site-a", "sentry:1", at("01:10"), 1, "sentry_resolved");
+      const [read] = await listResolveNotices(db, "site-a", 10, at("02:00"));
+
+      await ingest(db, TARGET, [issue({ kind: "issue.regressed", count: 2, lastSeen: iso("01:12") })], at("01:15"));
+      await deliverTo(at("01:15"), CHANNEL, "sentry:1", "555.666");
+      await resolveIncident(db, "site-a", "sentry:1", at("01:20"), 2, "sentry_missing");
+
+      await clearResolveNotice(db, read);
+      expect((await row()).resolveNotice).toBe("sentry_missing");
+      await clearResolveNotice(db, await row());
+      expect((await row()).resolveNotice).toBeNull();
+    });
+
+    it("[리뷰 P2] 보내는 사이 닫혀도 지금 유효한 표의 전송만 위치를 남긴다", async () => {
+      await ingest(db, TARGET, [issue({ count: 1 })], at("01:00"));
+      const { id } = await row();
+      const first = await claimNotification(db, id, at("01:00"));
+      // 보내는 사이 등급이 올라 첫 전송의 표가 무효가 되고, 다른 실행이 다시 알린다
+      await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:04") })], at("01:05"));
+      const second = await claimNotification(db, id, at("01:05"));
+      expect(await resolveIncident(db, "site-a", "sentry:1", at("01:06"), 1, "sentry_resolved")).toBe(true);
+
+      expect(await completeNotification(db, id, first!, "111.222", at("01:07"), CHANNEL)).toBe(false);
+      expect(await completeNotification(db, id, second!, "333.444", at("01:07"), CHANNEL)).toBe(true);
+      expect(await row()).toMatchObject({ status: "resolved", slackTs: "333.444", slackChannel: CHANNEL, resolveNotice: "sentry_resolved" });
+    });
+
+    it("보내는 중(표가 유효)인 incident는 고칠 목록에서 뺀다. 표가 오래되면 넣는다", async () => {
+      await ingest(db, TARGET, [issue({ count: 1 })], at("01:00"));
+      await deliverTo(at("01:00"), CHANNEL);
+      await ingest(db, TARGET, [issue({ count: 9, lastSeen: iso("01:04") })], at("01:05"));
+      const { id } = await row();
+      expect(await claimNotification(db, id, at("01:05"))).not.toBeNull();
+      await resolveIncident(db, "site-a", "sentry:1", at("01:06"), 1, "sentry_resolved");
+
+      expect(await listResolveNotices(db, "site-a", 10, at("01:06"))).toEqual([]);
+      // 전송하던 함수가 죽었다. 표의 유효 시간(10분)이 지나면 지난 메시지라도 고친다.
+      expect(await listResolveNotices(db, "site-a", 10, at("01:16"))).toHaveLength(1);
+    });
+
+    it("채널 id를 넘기지 않으면 모르는 것으로 둔다", async () => {
+      await ingest(db, TARGET, [issue()], at("01:00"));
+      await deliver(at("01:00"));
+      expect(await row()).toMatchObject({ slackTs: "111.222", slackChannel: null, resolveNotice: null });
     });
   });
 });

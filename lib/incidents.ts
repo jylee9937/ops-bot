@@ -35,6 +35,12 @@ const SLACK_REQUEST_RETENTION_MS = 60 * 60_000;
 const FINAL_DEPLOY_STATES = "'READY', 'ERROR', 'CANCELED', 'DELETED'";
 // 알림을 다시 보내야 하거나 보낼 필요가 없어지면 진행 중인 전송의 표를 무효로 만든다.
 const CLEAR_CLAIM = "notify_claimed_at = NULL, notify_claim = NULL";
+// 자동으로 닫을 때 남기는 이유(인자 하나: 이유). 고칠 상세 메시지가 있거나, 보내는 중(표가 있음)이라
+// 곧 생길 때만 남긴다. 닫을 때 표는 지우지 않으므로 보내던 쪽이 끝나면 completeNotification이 위치를 채운다.
+const SET_NOTICE = `resolve_notice = CASE
+  WHEN notify_claim IS NOT NULL OR (slack_ts IS NOT NULL AND slack_channel IS NOT NULL) THEN ? END`;
+// 닫을 때 보내는 중인 표는 남긴다. 보내던 쪽이 끝나면 그 메시지 위치를 기록해, 자동 해결 때 최신 메시지를 고친다.
+// 닫힌 행은 새로 보내지 않는다(getClaimedIncident·listClaimed가 status를 본다). 남은 표는 전송이 끝날 때 지워진다.
 // 외부 감시의 다운 시작 시각을 같은 다운으로 볼 차이. 시작 시각을 상태 지속 시간으로 거꾸로 계산하면
 // 호출마다 1초쯤 흔들린다. 실제로 새로 다운되려면 확인 간격(무료 5분)이 한 번은 지나야 한다.
 const SAME_DOWN_MS = 60_000;
@@ -98,6 +104,24 @@ export type StoredAnalysis = {
   at: string;
 };
 
+/**
+ * 자동으로 닫힌 이유. 상세 알림 메시지를 이 이유로 고친다.
+ * 외부 감시: 다시 UP · 멈춤 · 목록에서 사라짐. Sentry: 해결 · 무시 · issue가 사라짐(404).
+ */
+export const RESOLVE_NOTICES = [
+  "recovered",
+  "monitor_paused",
+  "monitor_missing",
+  "sentry_resolved",
+  "sentry_ignored",
+  "sentry_missing",
+] as const;
+export type ResolveNotice = (typeof RESOLVE_NOTICES)[number];
+
+function resolveNoticeOf(value: Row[string] | undefined): ResolveNotice | null {
+  return (RESOLVE_NOTICES as readonly unknown[]).includes(value) ? (value as ResolveNotice) : null;
+}
+
 export type Incident = {
   id: number;
   target: string;
@@ -112,7 +136,11 @@ export type Incident = {
   lastSeen: string;
   notifiedAt: string | null;
   slackTs: string | null;
+  // slackTs가 상세 메시지일 때 그 채널 id. 묶음 메시지거나 모르면 null.
+  slackChannel: string | null;
   resolvedAt: string | null;
+  // 자동으로 닫혀 Slack 메시지를 고칠 차례면 그 이유.
+  resolveNotice: ResolveNotice | null;
   pendingSince: string | null;
   version: number;
   analysis: StoredAnalysis | null;
@@ -153,7 +181,10 @@ function toIncident(row: Row): Incident {
     lastSeen: String(row.last_seen),
     notifiedAt: nullableString(row.notified_at),
     slackTs: nullableString(row.slack_ts),
+    // 마이그레이션 6 전에 읽은 행에는 칸이 없다.
+    slackChannel: row.slack_channel == null ? null : String(row.slack_channel),
     resolvedAt: nullableString(row.resolved_at),
+    resolveNotice: resolveNoticeOf(row.resolve_notice),
     pendingSince: nullableString(row.pending_since),
     version: Number(row.version),
     // 마이그레이션 4 전에 읽은 행에는 칸이 없다.
@@ -319,10 +350,10 @@ function planSignal(
       signal,
       statement: {
         sql: `UPDATE incidents
-              SET status = 'resolved', resolved_at = ?, pending_since = NULL, ${CLEAR_CLAIM},
+              SET status = 'resolved', resolved_at = ?, pending_since = NULL, ${SET_NOTICE},
                   version = version + 1
               WHERE id = ? AND version = ?`,
-        args: [nowIso, row.id, row.version],
+        args: [nowIso, signal.kind === "issue.resolved" ? "sentry_resolved" : "sentry_ignored", row.id, row.version],
       },
       outcomes: ["resolved"],
     };
@@ -388,7 +419,8 @@ function planSignal(
       statement: {
         sql: `UPDATE incidents
               SET status = 'open', episode = episode + 1, severity = ?, area = ?, title = ?,
-                  evidence = ?, last_seen = ?, resolved_at = NULL, slack_ts = NULL, ${CLEAR_CLAIM},
+                  evidence = ?, last_seen = ?, resolved_at = NULL, slack_ts = NULL, slack_channel = NULL,
+                  resolve_notice = NULL, notice_tried_at = NULL, ${CLEAR_CLAIM},
                   notified_at = ?, pending_since = ?, version = version + 1
               WHERE id = ? AND version = ?`,
         args: [
@@ -449,6 +481,8 @@ function planSignal(
 /**
  * ops-bot 상태만 바꾼다. Sentry에는 쓰지 않는다. 바뀌었으면 true.
  * `episode`를 주면 그 회차가 열려 있을 때만 닫는다. 확인한 뒤 다시 열린 새 회차를 닫지 않게 한다.
+ * `notice`는 자동으로 닫을 때의 이유다. 상세 메시지가 있으면 남겨 Slack 단계가 그 메시지를 고친다.
+ * 버튼으로 닫을 때는 주지 않는다(버튼 응답이 이미 메시지를 바꾼다). 보내는 중인 표는 지우지 않는다(SET_NOTICE 위 설명).
  */
 export async function resolveIncident(
   db: Client,
@@ -456,19 +490,88 @@ export async function resolveIncident(
   fingerprint: string,
   now: Date,
   episode?: number,
+  notice?: ResolveNotice,
 ): Promise<boolean> {
   const { rowsAffected } = await db.execute({
     sql: `UPDATE incidents
-          SET status = 'resolved', resolved_at = ?, pending_since = NULL, ${CLEAR_CLAIM},
-              version = version + 1
+          SET status = 'resolved', resolved_at = ?, pending_since = NULL,
+              ${notice === undefined ? "resolve_notice = NULL" : SET_NOTICE}, version = version + 1
           WHERE target = ? AND fingerprint = ? AND status = 'open'
             ${episode === undefined ? "" : "AND episode = ?"}`,
-    args: [now.toISOString(), targetId, fingerprint, ...(episode === undefined ? [] : [episode])],
+    args: [
+      now.toISOString(),
+      ...(notice === undefined ? [] : [notice]),
+      targetId,
+      fingerprint,
+      ...(episode === undefined ? [] : [episode]),
+    ],
   });
   return rowsAffected === 1;
 }
 
-/** 음소거하고, 아직 보내지 않은 알림도 함께 멈춘다. */
+/**
+ * Slack 메시지를 고칠 차례인 자동 해결 incident. 아직 시도하지 않은 것, 오래 시도하지 않은 것, 먼저 닫힌 것 순서.
+ * 상세 메시지 위치가 있고 보내는 중이 아닌 것만 돌려준다. 보내는 중이면 끝난 뒤(새 메시지 위치가 기록된 뒤) 나온다.
+ */
+export async function listResolveNotices(
+  db: Client,
+  targetId: string,
+  limit: number,
+  now: Date,
+): Promise<Incident[]> {
+  const { rows } = await db.execute({
+    sql: `SELECT * FROM incidents
+          WHERE target = ? AND status = 'resolved' AND resolve_notice IS NOT NULL
+            AND slack_ts IS NOT NULL AND slack_channel IS NOT NULL
+            AND (notify_claim IS NULL OR notify_claimed_at IS NULL OR notify_claimed_at <= ?)
+          ORDER BY notice_tried_at, resolved_at, id LIMIT ?`,
+    args: [targetId, isoBefore(now, CLAIM_TTL_MS), limit],
+  });
+  return rows.map(toIncident);
+}
+
+/** 그 메시지만 실패해 남겨 둔다. 다음 실행은 아직 시도하지 않은 것부터 고친다. */
+export async function markNoticeTried(
+  db: Client,
+  incident: Pick<Incident, "id" | "episode">,
+  now: Date,
+): Promise<void> {
+  await db.execute({
+    sql: `UPDATE incidents SET notice_tried_at = ? WHERE id = ? AND episode = ? AND resolve_notice IS NOT NULL`,
+    args: [now.toISOString(), incident.id, incident.episode],
+  });
+}
+
+/** `before`보다 먼저 닫혀 이제 고치지 않을 표시를 지운다. 지운 수를 돌려준다. */
+export async function clearStaleNotices(db: Client, targetId: string, before: Date): Promise<number> {
+  const { rowsAffected } = await db.execute({
+    sql: `UPDATE incidents SET resolve_notice = NULL
+          WHERE target = ? AND status = 'resolved' AND resolve_notice IS NOT NULL AND resolved_at < ?`,
+    args: [targetId, before.toISOString()],
+  });
+  return rowsAffected;
+}
+
+
+/**
+ * 메시지를 고쳤거나 포기했다. 읽은 뒤 다시 열려 새 회차·새 메시지가 됐으면 건드리지 않는다.
+ * 알림 상태와 무관한 칸이라 버전을 올리지 않는다.
+ */
+export async function clearResolveNotice(
+  db: Client,
+  incident: Pick<Incident, "id" | "episode" | "slackTs">,
+): Promise<void> {
+  await db.execute({
+    sql: `UPDATE incidents SET resolve_notice = NULL
+          WHERE id = ? AND episode = ? AND slack_ts IS ? AND status = 'resolved'`,
+    args: [incident.id, incident.episode, incident.slackTs],
+  });
+}
+
+/**
+ * 음소거하고, 아직 보내지 않은 알림도 함께 멈춘다.
+ * 자동 해결로 고칠 차례였던 메시지도 고치지 않는다. 버튼 응답이 이미 음소거로 바꿨다(사람의 마지막 조작을 남긴다).
+ */
 export async function muteIncident(
   db: Client,
   targetId: string,
@@ -486,7 +589,7 @@ export async function muteIncident(
       {
         sql: `UPDATE incidents
               SET notified_at = COALESCE(notified_at, ?), pending_since = NULL, ${CLEAR_CLAIM},
-                  version = version + 1
+                  resolve_notice = NULL, version = version + 1
               WHERE target = ? AND fingerprint = ?`,
         args: [now.toISOString(), targetId, fingerprint],
       },
@@ -601,7 +704,10 @@ export async function listClaimed(db: Client, claim: string): Promise<Incident[]
   return rows.map(toIncident);
 }
 
-/** 여러 건을 한 번에 전달 완료로 기록한다(묶음 메시지). 표가 유효한 건만 반영하고 그 수를 돌려준다. */
+/**
+ * 여러 건을 한 번에 전달 완료로 기록한다(묶음 메시지). 표가 유효한 건만 반영하고 그 수를 돌려준다.
+ * 묶음 메시지는 자동 해결 때 고치지 않으므로 채널 id를 비운다.
+ */
 export async function completeNotifications(
   db: Client,
   ids: readonly number[],
@@ -612,9 +718,11 @@ export async function completeNotifications(
   if (ids.length === 0) return 0;
   const { rowsAffected } = await db.execute({
     sql: `UPDATE incidents
-          SET notified_at = ?, slack_ts = COALESCE(?, slack_ts), ${CLEAR_CLAIM}, pending_since = NULL
+          SET notified_at = ?, slack_ts = COALESCE(?, slack_ts),
+              slack_channel = CASE WHEN ? IS NULL THEN slack_channel END,
+              ${CLEAR_CLAIM}, pending_since = NULL
           WHERE notify_claim = ? AND id IN (${ids.map(() => "?").join(", ")})`,
-    args: [now.toISOString(), slackTs, claim, ...ids],
+    args: [now.toISOString(), slackTs, slackTs, claim, ...ids],
   });
   return rowsAffected;
 }
@@ -646,19 +754,26 @@ export async function claimNotification(
   return rowsAffected === 1 ? claim : null;
 }
 
-/** 전달 완료로 기록한다. 표가 무효가 됐으면 false이고, 새 알림은 그대로 대기한다. */
+/**
+ * 전달 완료로 기록한다. 표가 무효가 됐으면(등급 상승·음소거·재개방·다른 실행이 다시 받음) false이고, 새 알림은 그대로 대기한다.
+ * 보내는 사이 닫혔으면 표가 남아 있어 기록한다. 자동 해결이면 이 메시지를 고친다.
+ */
 export async function completeNotification(
   db: Client,
   id: number,
   claim: string,
   slackTs: string | null,
   now: Date,
+  // 상세 메시지를 보낸 채널 id. ts와 함께 바꾼다(ts가 없으면 둘 다 그대로).
+  slackChannel: string | null = null,
 ): Promise<boolean> {
   const { rowsAffected } = await db.execute({
     sql: `UPDATE incidents
-          SET notified_at = ?, slack_ts = COALESCE(?, slack_ts), ${CLEAR_CLAIM}, pending_since = NULL
+          SET notified_at = ?, slack_ts = COALESCE(?, slack_ts),
+              slack_channel = CASE WHEN ? IS NULL THEN slack_channel ELSE ? END,
+              ${CLEAR_CLAIM}, pending_since = NULL
           WHERE id = ? AND notify_claim = ?`,
-    args: [now.toISOString(), slackTs, id, claim],
+    args: [now.toISOString(), slackTs, slackTs, slackChannel, id, claim],
   });
   return rowsAffected === 1;
 }

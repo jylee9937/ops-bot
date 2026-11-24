@@ -5,7 +5,7 @@ import monitors from "./__fixtures__/uptimerobot-monitors.json";
 import { SourceError } from "./shared";
 import {
   fetchUptimeMonitors,
-  isRecovered,
+  recoveryOf,
   monitorsFor,
   uptimeSignals,
   type UptimeMonitor,
@@ -222,18 +222,18 @@ describe("uptimeSignals", () => {
   });
 });
 
-describe("isRecovered", () => {
+describe("recoveryOf", () => {
   const full = { complete: true, skipped: 0 };
   it.each([
-    ["UP", monitor({ status: "UP" }), full, true],
-    ["멈춤", monitor({ status: "PAUSED" }), full, true],
-    ["여전히 DOWN", monitor({ status: "DOWN" }), full, false],
-    ["준비 중", monitor({ status: "STARTED" }), full, false],
-    ["목록에서 사라짐(빠짐없이 읽음)", undefined, full, true],
-    ["목록에서 사라짐(다 못 읽음)", undefined, { complete: false, skipped: 0 }, false],
-    ["[리뷰 P2] 목록에서 사라짐(건너뛴 항목 있음)", undefined, { complete: true, skipped: 1 }, false],
+    ["UP", monitor({ status: "UP" }), full, "recovered"],
+    ["멈춤", monitor({ status: "PAUSED" }), full, "monitor_paused"],
+    ["여전히 DOWN", monitor({ status: "DOWN" }), full, null],
+    ["준비 중", monitor({ status: "STARTED" }), full, null],
+    ["목록에서 사라짐(빠짐없이 읽음)", undefined, full, "monitor_missing"],
+    ["목록에서 사라짐(다 못 읽음)", undefined, { complete: false, skipped: 0 }, null],
+    ["[리뷰 P2] 목록에서 사라짐(건너뛴 항목 있음)", undefined, { complete: true, skipped: 1 }, null],
   ])("%s", (_label, value, list, expected) => {
-    expect(isRecovered(value, list)).toBe(expected);
+    expect(recoveryOf(value, list)).toBe(expected);
   });
 });
 

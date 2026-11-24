@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 const POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
+const UPDATE_URL = "https://slack.com/api/chat.update";
 const REQUEST_TIMEOUT_MS = 10_000;
 // Slack 권장값. 이보다 오래된 요청은 재전송 공격으로 본다.
 const SIGNATURE_TOLERANCE_S = 300;
@@ -13,6 +14,7 @@ const MAX_COMMAND_TEXT = 200;
 const SECTION_TEXT_LIMIT = 3_000;
 
 const USER_ID = /^[UW][A-Z0-9]{2,20}$/;
+const CHANNEL_ID = /^[CGD][A-Z0-9]{2,20}$/;
 const ERROR_CODE = /^[a-z_]{1,64}$/;
 
 export type MrkdwnText = { type: "mrkdwn"; text: string; verbatim: true };
@@ -69,9 +71,15 @@ export function isSlackUserId(value: string | undefined): value is string {
   return value !== undefined && USER_ID.test(value);
 }
 
+export function isSlackChannelId(value: string | null | undefined): value is string {
+  return typeof value === "string" && CHANNEL_ID.test(value);
+}
+
 export type SlackErrorReason =
   | "auth"
   | "channel"
+  // 고칠 메시지가 지워졌거나 고칠 수 없다(chat.update)
+  | "message"
   | "rate_limit"
   | "server"
   | "bad_request"
@@ -110,12 +118,27 @@ const AUTH_ERRORS = new Set([
 ]);
 const CHANNEL_ERRORS = new Set(["channel_not_found", "not_in_channel", "is_archived"]);
 const RATE_LIMIT_ERRORS = new Set(["ratelimited", "rate_limited"]);
+const MESSAGE_ERRORS = new Set(["message_not_found", "cant_update_message", "edit_window_closed"]);
+// HTTP 200에 담겨 오는 Slack 쪽 장애·일시 상태. 다시 하면 될 수 있다.
+const SERVER_ERRORS = new Set([
+  "internal_error",
+  "fatal_error",
+  "service_unavailable",
+  "request_timeout",
+  "update_failed",
+  "external_channel_migrating",
+  "team_added_to_org",
+]);
 
-const postMessageResponse = z.object({
+const chatResponse = z.object({
   ok: z.boolean(),
   ts: z.string().min(1).optional(),
+  channel: z.string().optional(),
   error: z.string().optional(),
 });
+
+/** 보낸 메시지의 위치. `channel`은 Slack이 돌려준 채널 id다. 형식이 다르면 null이고, 그 메시지는 나중에 고치지 않는다. */
+export type PostedMessage = { ts: string; channel: string | null };
 
 export type SlackRequestOptions = { fetchImpl?: typeof fetch; signal?: AbortSignal };
 
@@ -124,24 +147,22 @@ function requestSignal(signal: AbortSignal | undefined): AbortSignal {
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-/**
- * 메시지를 보내고 `ts`를 돌려준다. 미리보기(unfurl)와 자동 링크는 끈다.
- * Slack은 실패해도 HTTP 200에 `ok: false`를 주므로 본문까지 확인한다.
- */
-export async function postMessage(
-  message: SlackMessage,
+/** chat.* 요청 하나. Slack은 실패해도 HTTP 200에 `ok: false`를 주므로 본문까지 확인한다. */
+async function callChat(
+  url: string,
+  payload: Record<string, unknown>,
   token: string,
-  { fetchImpl = fetch, signal }: SlackRequestOptions = {},
-): Promise<{ ts: string }> {
+  { fetchImpl = fetch, signal }: SlackRequestOptions,
+): Promise<PostedMessage> {
   let response: Response;
   try {
-    response = await fetchImpl(POST_MESSAGE_URL, {
+    response = await fetchImpl(url, {
       method: "POST",
       headers: {
         authorization: `Bearer ${token}`,
         "content-type": "application/json; charset=utf-8",
       },
-      body: JSON.stringify({ ...message, parse: "none", unfurl_links: false, unfurl_media: false }),
+      body: JSON.stringify(payload),
       signal: requestSignal(signal),
     });
   } catch {
@@ -158,20 +179,54 @@ export async function postMessage(
   } catch {
     throw new SlackError("invalid_response");
   }
-  const parsed = postMessageResponse.safeParse(json);
+  const parsed = chatResponse.safeParse(json);
   if (!parsed.success) throw new SlackError("invalid_response");
 
-  const { ok, ts, error } = parsed.data;
-  if (ok && ts) return { ts };
+  const { ok, ts, channel, error } = parsed.data;
+  if (ok && ts) return { ts, channel: isSlackChannelId(channel) ? channel : null };
   if (ok) throw new SlackError("invalid_response");
 
   const code = error && ERROR_CODE.test(error) ? error : undefined;
   if (code && AUTH_ERRORS.has(code)) throw new SlackError("auth", code);
   if (code && CHANNEL_ERRORS.has(code)) throw new SlackError("channel", code);
+  if (code && MESSAGE_ERRORS.has(code)) throw new SlackError("message", code);
+  if (code && SERVER_ERRORS.has(code)) throw new SlackError("server", code);
   if (code && RATE_LIMIT_ERRORS.has(code)) {
     throw new SlackError("rate_limit", code, retryAfterOf(response));
   }
   throw new SlackError("bad_request", code);
+}
+
+/** 메시지를 보내고 위치(`ts`·채널 id)를 돌려준다. 미리보기(unfurl)와 자동 링크는 끈다. */
+export async function postMessage(
+  message: SlackMessage,
+  token: string,
+  options: SlackRequestOptions = {},
+): Promise<PostedMessage> {
+  return callChat(
+    POST_MESSAGE_URL,
+    { ...message, parse: "none", unfurl_links: false, unfurl_media: false },
+    token,
+    options,
+  );
+}
+
+/**
+ * 보낸 메시지를 고친다(chat.update). 채널은 설정의 이름이 아니라 보낼 때 돌려받은 id를 쓴다.
+ * 설정에서 채널 이름을 바꿔도 원래 메시지를 찾는다. 자동 링크는 보낼 때처럼 끈다.
+ */
+export async function updateMessage(
+  location: { channel: string; ts: string },
+  message: SlackMessage,
+  token: string,
+  options: SlackRequestOptions = {},
+): Promise<void> {
+  await callChat(
+    UPDATE_URL,
+    { channel: location.channel, ts: location.ts, text: message.text, blocks: message.blocks, parse: "none" },
+    token,
+    options,
+  );
 }
 
 /** 버튼을 누른 메시지에 응답한다. 주소는 `parseInteraction`이 Slack 주소인지 확인했다. */

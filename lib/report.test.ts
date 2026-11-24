@@ -6,9 +6,11 @@ import {
   getIncident,
   ingest,
   listPending,
+  muteIncident,
   recordDeploys,
   resolveIncident,
   type Incident,
+  type ResolveNotice,
 } from "./incidents";
 import type { Analysis, AnalysisInput, AnalysisOutcome, Analyzer } from "./analysis";
 import { maskFrame, maskLogMessage, tagOf, type MaskedFrame } from "./mask";
@@ -16,12 +18,18 @@ import {
   ANALYSIS_SEND_RESERVE_MS,
   bundleMessage,
   deliverPending,
+  DeliveryStopped,
   DETAIL_LIMIT,
   handleAction,
   incidentMessage,
   MUTE_LONG_MS,
+  NOTICE_LIMIT,
+  NOTICE_MAX_AGE_MS,
   planReport,
+  SEND_INTERVAL_MS,
+  updateResolvedMessages,
   type Send,
+  type Update,
 } from "./report";
 import type { Signal } from "./signal";
 import {
@@ -927,5 +935,317 @@ describe("report", () => {
       await deliverPending(db, TARGET, at("01:01"), send, { ...NO_WAIT, sites: [TARGET] });
       expect(allText(sent[0])).not.toContain("같은 시각");
     });
+  });
+});
+
+describe("자동 해결 때 메시지 고치기", () => {
+  let db: Client;
+  let cleanup: () => void;
+  const CHANNEL = "C0OPSA1";
+  // 보낸 메시지 번호. 여러 번 보내도 ts가 겹치지 않게 한다.
+  let sentCount = 0;
+
+  beforeEach(async () => {
+    ({ db, cleanup } = await createTestDb());
+    sentCount = 0;
+  });
+  afterEach(() => cleanup());
+
+  const incidentOf = async (fingerprint: string): Promise<Incident> => {
+    const { rows } = await db.execute({ sql: "SELECT id FROM incidents WHERE fingerprint = ?", args: [fingerprint] });
+    const incident = await getIncident(db, Number(rows[0].id));
+    if (!incident) throw new Error("incident가 없습니다");
+    return incident;
+  };
+
+  /** 신호를 받아 알림을 보낸다. Slack은 채널 id를 돌려준다(`channel: null`이면 돌려주지 않음). */
+  async function alerted(signals: Signal[], channel: string | null = CHANNEL) {
+    await ingest(db, TARGET, signals, at("01:00"));
+    const send: Send = async () => ({ ts: `1700000000.${String(++sentCount).padStart(6, "0")}`, channel });
+    await deliverPending(db, TARGET, at("01:00"), send, { ...NO_WAIT, ownerUserId: OWNER });
+  }
+
+  const closeAll = async (fingerprints: string[], notice: ResolveNotice = "sentry_resolved", time = "01:10") => {
+    for (const fingerprint of fingerprints) {
+      expect(await resolveIncident(db, TARGET.id, fingerprint, at(time), 1, notice)).toBe(true);
+    }
+  };
+
+  /** 고친 메시지를 기록하는 가짜 Slack. `fail`이 오류를 돌려주면 그 차례에 던진다. */
+  function updater(fail: (index: number) => unknown = () => undefined) {
+    const updates: { location: { channel: string; ts: string }; message: SlackMessage }[] = [];
+    const update: Update = async (location, message) => {
+      const index = updates.length;
+      updates.push({ location, message });
+      const error = fail(index);
+      if (error) throw error;
+    };
+    return { updates, update };
+  }
+
+  it("원래 메시지의 버튼을 없애고 닫힌 이유·시각을 적는다. 한 번만 고친다", async () => {
+    await alerted([issue(1, "auth")]);
+    await closeAll(["sentry:1"]);
+    const { updates, update } = updater();
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), update, { ...NO_WAIT, sites: [TARGET] });
+
+    expect(result).toEqual({ updated: 1, dropped: 0, kept: 0, error: null });
+    expect(updates).toHaveLength(1);
+    const [{ location, message }] = updates;
+    expect(location).toEqual({ channel: CHANNEL, ts: "1700000000.000001" });
+    expect(actionsOf(message)).toEqual([]);
+    expect(allText(message)).toContain("Sentry에서 해결됨 · 11/07 10:10 · 자동 처리");
+    expect(message.text).toBe("[P1][사이트 A] Sentry에서 해결됨 · 11/07 10:10");
+    // P1이어도 고친 메시지에서는 다시 멘션하지 않는다
+    expect(allText(message)).not.toContain(`<@${OWNER}>`);
+    expect((await incidentOf("sentry:1")).resolveNotice).toBeNull();
+
+    expect(await updateResolvedMessages(db, TARGET, at("01:20"), update, NO_WAIT)).toEqual({ updated: 0, dropped: 0, kept: 0, error: null });
+    expect(updates).toHaveLength(1);
+  });
+
+  it.each([
+    ["recovered", "회복 확인"],
+    ["monitor_paused", "감시를 멈춰 닫음"],
+    ["monitor_missing", "감시가 없어져 닫음"],
+    ["sentry_resolved", "Sentry에서 해결됨"],
+    ["sentry_ignored", "Sentry에서 무시됨"],
+    ["sentry_missing", "Sentry에서 사라져 닫음"],
+  ] as const)("%s는 '%s' 문구로 적는다", async (notice, label) => {
+    await ingest(db, TARGET, [issue(1)], at("01:00"));
+    const message = incidentMessage(TARGET, await incidentOf("sentry:1"), {
+      state: { kind: "auto_resolved", at: at("01:10"), notice },
+    });
+    expect(message.text).toBe(`[P2][사이트 A] ${label} · 11/07 10:10`);
+    expect(actionsOf(message)).toEqual([]);
+  });
+
+  it("버튼으로 닫았거나, 채널 id를 모르거나, 묶음으로 보낸 메시지는 고치지 않는다", async () => {
+    const many = Array.from({ length: DETAIL_LIMIT + 1 }, (_, i) => issue(i + 1));
+    await alerted(many);
+    await alerted([issue(100)], null);
+    // 버튼으로 닫음
+    expect(await resolveIncident(db, TARGET.id, "sentry:1", at("01:10"), 1)).toBe(true);
+    await closeAll([...many.slice(1).map((signal) => signal.fingerprint), "sentry:100"]);
+    const { updates, update } = updater();
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), update, NO_WAIT);
+
+    // 상세로 보낸 5건 중 버튼으로 닫은 1건을 뺀 4건. 묶음 1건과 채널 id를 모르는 1건은 고치지 않는다.
+    expect(result.updated).toBe(DETAIL_LIMIT - 1);
+    expect(new Set(updates.map(({ location }) => location.ts)).size).toBe(DETAIL_LIMIT - 1);
+    const bundled = await incidentOf(`sentry:${DETAIL_LIMIT + 1}`);
+    expect(bundled).toMatchObject({ slackChannel: null, resolveNotice: null });
+  });
+
+  it("메시지·채널이 없어졌으면 포기하고 다음 것을 고친다", async () => {
+    await alerted([issue(1), issue(2), issue(3)]);
+    await closeAll(["sentry:1", "sentry:2", "sentry:3"]);
+    const { updates, update } = updater((index) =>
+      index === 0 ? new SlackError("message", "message_not_found") : index === 1 ? new SlackError("channel", "channel_not_found") : undefined,
+    );
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), update, NO_WAIT);
+
+    expect(result).toEqual({ updated: 1, dropped: 2, kept: 0, error: null });
+    expect(updates).toHaveLength(3);
+    for (const n of [1, 2, 3]) expect((await incidentOf(`sentry:${n}`)).resolveNotice).toBeNull();
+  });
+
+  it.each([
+    ["rate limit", new SlackError("rate_limit", "ratelimited", 30_000)],
+    ["[리뷰 P2] Slack 장애(internal_error)", new SlackError("server", "internal_error")],
+    ["인증", new SlackError("auth", "token_revoked")],
+    ["네트워크", new SlackError("network")],
+  ])("%s면 표시를 남기고 이번 실행의 고치기를 멈춘다", async (_label, error) => {
+    await alerted([issue(1), issue(2)]);
+    await closeAll(["sentry:1", "sentry:2"]);
+    const { updates, update } = updater(() => error);
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), update, NO_WAIT);
+
+    expect(result.error).toBe(error);
+    expect(updates).toHaveLength(1);
+    for (const n of [1, 2]) expect((await incidentOf(`sentry:${n}`)).resolveNotice).toBe("sentry_resolved");
+  });
+
+  it("[리뷰 P2] 이 메시지만의 알 수 없는 실패면 남겨 두고 다음 것을 고친다. 내용이 거절되면 포기한다", async () => {
+    await alerted([issue(1), issue(2), issue(3)]);
+    await closeAll(["sentry:1", "sentry:2", "sentry:3"]);
+    const { updates, update } = updater((index) =>
+      index === 0 ? new SlackError("bad_request", "some_new_error") : index === 1 ? new SlackError("bad_request", "invalid_blocks") : undefined,
+    );
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), update, NO_WAIT);
+
+    expect(result).toEqual({ updated: 1, dropped: 1, kept: 1, error: null });
+    expect(updates).toHaveLength(3);
+    expect((await incidentOf("sentry:1")).resolveNotice).toBe("sentry_resolved");
+    expect((await incidentOf("sentry:2")).resolveNotice).toBeNull();
+  });
+
+  it("[리뷰 P2] 상세 메시지를 보내는 사이 자동으로 닫혀도 그 메시지 위치를 남겨 나중에 고친다", async () => {
+    await ingest(db, TARGET, [issue(1)], at("01:00"));
+    // 배포 실패 webhook이 보내는 사이 collect가 Sentry 해결을 확인해 닫았다
+    const send: Send = async () => {
+      expect(await resolveIncident(db, TARGET.id, "sentry:1", at("01:00"), 1, "sentry_resolved")).toBe(true);
+      return { ts: "1700000000.000009", channel: CHANNEL };
+    };
+    const delivery = await deliverPending(db, TARGET, at("01:00"), send, NO_WAIT);
+    expect(delivery.detailed).toBe(1);
+    expect(await incidentOf("sentry:1")).toMatchObject({
+      status: "resolved",
+      slackTs: "1700000000.000009",
+      slackChannel: CHANNEL,
+      resolveNotice: "sentry_resolved",
+    });
+
+    const { updates, update } = updater();
+    expect(await updateResolvedMessages(db, TARGET, at("01:05"), update, NO_WAIT)).toMatchObject({ updated: 1 });
+    expect(updates[0].location).toEqual({ channel: CHANNEL, ts: "1700000000.000009" });
+  });
+
+  it("보내는 사이 버튼으로 닫거나 음소거하면 그 메시지는 자동으로 고치지 않는다", async () => {
+    await ingest(db, TARGET, [issue(1), issue(2)], at("01:00"));
+    let index = 0;
+    const send: Send = async () => {
+      if (index === 0) await resolveIncident(db, TARGET.id, "sentry:1", at("01:00"), 1);
+      else await muteIncident(db, TARGET.id, "sentry:2", at("02:00"), at("01:00"));
+      return { ts: `1700000000.00000${++index}`, channel: CHANNEL };
+    };
+    await deliverPending(db, TARGET, at("01:00"), send, NO_WAIT);
+    // 닫힌 뒤 끝난 전송도 위치는 남는다. 자동 해결이 아니라 표시는 없다. 음소거는 표를 무효로 해 남기지 않는다.
+    expect(await incidentOf("sentry:1")).toMatchObject({ slackTs: "1700000000.000001", resolveNotice: null });
+    expect(await incidentOf("sentry:2")).toMatchObject({ slackTs: null, resolveNotice: null });
+
+    const { updates, update } = updater();
+    await updateResolvedMessages(db, TARGET, at("01:05"), update, NO_WAIT);
+    expect(updates).toHaveLength(0);
+  });
+
+  it("[리뷰 P2] 다시 알림을 보내는 중에 닫히면 끝날 때까지 기다렸다가 새 메시지를 고친다", async () => {
+    await alerted([issue(1)]);
+    // 크게 늘어 등급이 올라 다시 알린다. 보내는 사이 Sentry에서 닫히고 collect의 고치기 단계가 돈다.
+    await ingest(db, TARGET, [issue(1, "articles", { count: 9, lastSeen: iso("01:04") })], at("01:05"));
+    const during = updater();
+    const send: Send = async () => {
+      expect(await resolveIncident(db, TARGET.id, "sentry:1", at("01:05"), 1, "sentry_resolved")).toBe(true);
+      expect(await updateResolvedMessages(db, TARGET, at("01:05"), during.update, NO_WAIT)).toMatchObject({ updated: 0 });
+      return { ts: "1700000000.000009", channel: CHANNEL };
+    };
+    await deliverPending(db, TARGET, at("01:05"), send, NO_WAIT);
+    expect(during.updates).toHaveLength(0);
+    expect(await incidentOf("sentry:1")).toMatchObject({ slackTs: "1700000000.000009", resolveNotice: "sentry_resolved" });
+
+    const after = updater();
+    expect(await updateResolvedMessages(db, TARGET, at("01:10"), after.update, NO_WAIT)).toMatchObject({ updated: 1 });
+    expect(after.updates[0].location.ts).toBe("1700000000.000009");
+  });
+
+  it("[리뷰 P2] 이 메시지만 실패해 남겨 둔 것이 뒤의 메시지를 계속 막지 않는다", async () => {
+    const signals = Array.from({ length: NOTICE_LIMIT + 1 }, (_, i) => issue(i + 1));
+    await alerted(signals.slice(0, DETAIL_LIMIT));
+    await alerted(signals.slice(DETAIL_LIMIT));
+    await closeAll(signals.map((signal) => signal.fingerprint));
+    const stuck = new Set(Array.from({ length: NOTICE_LIMIT }, (_, i) => `1700000000.00000${i + 1}`));
+    const { updates, update } = updater((index) =>
+      stuck.has(updates[index].location.ts) ? new SlackError("bad_request", "some_new_error") : undefined,
+    );
+
+    expect(await updateResolvedMessages(db, TARGET, at("01:15"), update, NO_WAIT)).toMatchObject({ updated: 0, kept: NOTICE_LIMIT });
+    expect(await updateResolvedMessages(db, TARGET, at("01:20"), update, NO_WAIT)).toMatchObject({ updated: 1 });
+    // 두 번째 실행은 아직 시도하지 않은 6번째부터 고친다
+    expect(updates[NOTICE_LIMIT].location).toEqual({ channel: CHANNEL, ts: `1700000000.00000${NOTICE_LIMIT + 1}` });
+    expect((await incidentOf(`sentry:${NOTICE_LIMIT + 1}`)).resolveNotice).toBeNull();
+  });
+
+  it("[리뷰 P2] 음소거 버튼을 누르면 자동 해결로 고칠 차례였던 메시지를 고치지 않는다", async () => {
+    await alerted([issue(1)]);
+    await closeAll(["sentry:1"]);
+    const incident = await incidentOf("sentry:1");
+    await handleAction(db, [TARGET], interaction(incident, "mute_1h"), at("01:12"));
+    const { updates, update } = updater();
+
+    await updateResolvedMessages(db, TARGET, at("01:15"), update, NO_WAIT);
+
+    expect(updates).toHaveLength(0);
+    expect((await incidentOf("sentry:1")).resolveNotice).toBeNull();
+  });
+
+  it("[리뷰 P2] 앞 메시지를 고치는 사이 음소거하면 그 메시지는 고치지 않는다", async () => {
+    await alerted([issue(1), issue(2)]);
+    await closeAll(["sentry:1", "sentry:2"]);
+    const { updates, update } = updater();
+    // 첫 메시지를 고치는 사이 두 번째 메시지의 음소거 버튼을 눌렀다(목록은 이미 읽었다)
+    const racing: Update = async (location, message) => {
+      await update(location, message);
+      if (updates.length === 1) await muteIncident(db, TARGET.id, "sentry:2", at("02:00"), at("01:12"));
+    };
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), racing, NO_WAIT);
+
+    expect(result.updated).toBe(1);
+    expect(updates.map(({ location }) => location.ts)).toEqual(["1700000000.000001"]);
+  });
+
+  it("일시적인 실패면 표시를 남기고 멈춘다. 다음 실행이 다시 고친다", async () => {
+    await alerted([issue(1), issue(2)]);
+    await closeAll(["sentry:1", "sentry:2"]);
+    const failing = updater(() => new SlackError("rate_limit", "ratelimited", 30_000));
+
+    const first = await updateResolvedMessages(db, TARGET, at("01:15"), failing.update, NO_WAIT);
+
+    expect(first.error).toBeInstanceOf(SlackError);
+    expect(first).toMatchObject({ updated: 0, dropped: 0 });
+    expect(failing.updates).toHaveLength(1);
+    expect((await incidentOf("sentry:1")).resolveNotice).toBe("sentry_resolved");
+
+    const { updates, update } = updater();
+    expect(await updateResolvedMessages(db, TARGET, at("01:20"), update, NO_WAIT)).toMatchObject({ updated: 2 });
+    expect(updates.map(({ location }) => location.ts)).toEqual(["1700000000.000001", "1700000000.000002"]);
+  });
+
+  it("[경계] 닫힌 지 하루가 지나면 고치지 않고 포기한다", async () => {
+    await alerted([issue(1), issue(2)]);
+    await closeAll(["sentry:1"], "sentry_resolved", "01:10");
+    await closeAll(["sentry:2"], "sentry_resolved", "01:11");
+    const { updates, update } = updater();
+    const now = new Date(at("01:11").getTime() + NOTICE_MAX_AGE_MS);
+
+    const result = await updateResolvedMessages(db, TARGET, now, update, NO_WAIT);
+
+    // 정확히 하루 된 것은 고치고, 1분 더 지난 것은 포기한다
+    expect(result).toEqual({ updated: 1, dropped: 1, kept: 0, error: null });
+    expect(updates.map(({ location }) => location.ts)).toEqual(["1700000000.000002"]);
+    expect((await incidentOf("sentry:1")).resolveNotice).toBeNull();
+  });
+
+  it("예산이 끝나면 고치지 않고 다음 실행에 맡긴다", async () => {
+    await alerted([issue(1)]);
+    await closeAll(["sentry:1"]);
+    const { updates, update } = updater();
+
+    const result = await updateResolvedMessages(db, TARGET, at("01:15"), update, { ...NO_WAIT, shouldStop: () => true });
+
+    expect(result.error).toBeInstanceOf(DeliveryStopped);
+    expect(updates).toHaveLength(0);
+    expect((await incidentOf("sentry:1")).resolveNotice).toBe("sentry_resolved");
+  });
+
+  it("이어 고칠 때 간격을 두고, 실행당 상한까지만 고친다", async () => {
+    const signals = Array.from({ length: NOTICE_LIMIT + 1 }, (_, i) => issue(i + 1));
+    // 상세 상한(5)을 넘지 않게 두 번에 나눠 보낸다
+    await alerted(signals.slice(0, DETAIL_LIMIT));
+    await alerted(signals.slice(DETAIL_LIMIT));
+    await closeAll(signals.map((signal) => signal.fingerprint));
+    const waits: number[] = [];
+    const { updates, update } = updater();
+
+    await updateResolvedMessages(db, TARGET, at("01:15"), update, { sleep: async (ms) => void waits.push(ms) });
+
+    expect(updates).toHaveLength(NOTICE_LIMIT);
+    expect(waits).toEqual(Array(NOTICE_LIMIT - 1).fill(SEND_INTERVAL_MS));
+    expect(await updateResolvedMessages(db, TARGET, at("01:20"), update, NO_WAIT)).toMatchObject({ updated: 1 });
   });
 });

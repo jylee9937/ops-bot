@@ -119,6 +119,20 @@ const MIGRATIONS: readonly { version: number; statements: readonly string[] }[] 
         )`,
       ],
     },
+    {
+      version: 6,
+      statements: [
+        // 상세 알림을 보낸 채널 id(Slack이 돌려준 값). 자동으로 닫힐 때 그 메시지를 고친다.
+        // 묶음 메시지면 비운다. 여러 incident가 같은 메시지를 쓰니 한 incident의 상태로 덮지 않게.
+        `ALTER TABLE incidents ADD COLUMN slack_channel TEXT`,
+        // 자동으로 닫혔는데 아직 Slack 메시지에 반영하지 못한 이유. 반영하거나 포기하면 비운다.
+        `ALTER TABLE incidents ADD COLUMN resolve_notice TEXT`,
+        // 그 메시지만 실패해 남겨 둔 마지막 시도 시각. 오래 시도하지 않은 것부터 고쳐 뒤의 메시지가 밀리지 않게 한다.
+        `ALTER TABLE incidents ADD COLUMN notice_tried_at TEXT`,
+        `CREATE INDEX incidents_resolve_notice ON incidents (target, resolved_at)
+          WHERE resolve_notice IS NOT NULL`,
+      ],
+    },
   ];
 
 export function createDb(

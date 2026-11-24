@@ -138,6 +138,7 @@ const STEP_NAMES: Record<StepResult["step"], string> = {
   "sentry-status": "Sentry 해결 확인",
   uptime: "외부 감시",
   slack: "Slack 전송",
+  "slack-update": "Slack 메시지 고침",
 };
 
 /** 수동 collect 결과. 건수와 단계별 성공만 담는다(incident 내용은 평소처럼 채널 알림으로 나간다). */
@@ -155,7 +156,7 @@ export function collectReport(result: CollectResult, targets: readonly Target[])
       ? [`• 실패 단계: ${failed.map((s) => `${nameOf(s.target)} ${STEP_NAMES[s.step]}(${s.reason ?? "?"})`).join(", ")}`]
       : []),
     `• incident: 새로 ${i.created} · 갱신 ${i.updated} · 재개방 ${i.reopened} · 등급 상승 ${i.escalated} · 해결 ${i.resolved} · 무시 ${i.ignored}`,
-    `• 알림: 상세 ${d.detailed} · 묶음 ${d.bundled} · 건너뜀 ${d.skipped} · Claude 요약 ${d.analyzed}(실패 ${d.analysisFailed})`,
+    `• 알림: 상세 ${d.detailed} · 묶음 ${d.bundled} · 건너뜀 ${d.skipped} · Claude 요약 ${d.analyzed}(실패 ${d.analysisFailed}) · 자동 해결로 고친 메시지 ${d.updated}`,
   ].join("\n");
 }
 

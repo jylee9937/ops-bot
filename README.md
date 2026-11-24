@@ -64,7 +64,8 @@ pnpm dev
 ### 운영 실행
 
 - `vercel.json`의 Cron이 5분마다 `GET /api/cron/collect`를 부릅니다(`Authorization: Bearer CRON_SECRET`).
-- 한 번의 실행: 잠금 → 스키마 확인 → 사이트마다 Vercel 배포 → Sentry issue → Sentry 해결 확인 → Slack 전송 → 정리 → heartbeat.
+- 한 번의 실행: 잠금 → 스키마 확인 → 사이트마다 Vercel 배포 → Sentry issue → Sentry 해결 확인 → Slack 전송 → 자동 해결 메시지 고치기 → 정리 → heartbeat.
+- 자동으로 닫힌 incident(외부 감시 회복·멈춤·삭제, Sentry 해결·무시·삭제)는 원래 상세 알림을 `chat.update`로 고칩니다. 버튼을 없애고 `회복 확인 · 11/24 01:05 · 자동 처리`처럼 이유와 닫힌 시각을 적습니다. 묶음 메시지는 고치지 않습니다. Slack이 일시적으로 실패하면 다음 실행이 다시 고치고, 하루가 지나면 포기합니다.
 - 출처 하나가 실패해도 나머지는 계속합니다. 실패한 출처는 커서를 옮기지 않아 다음 실행이 다시 읽습니다.
 - heartbeat는 모든 수집 단계가 성공하고 15분 넘게 못 보낸 알림이 없을 때만 보냅니다.
 - 응답에는 단계별 성공 여부와 건수만 담습니다. 설정이 틀리면 문제가 있는 변수 이름만 돌려줍니다.

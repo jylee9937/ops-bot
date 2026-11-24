@@ -79,13 +79,23 @@ function world() {
     sentryIssues: [] as unknown[],
     sentryStatus: {} as Record<string, string | number>,
     deployments: [] as unknown[],
-    fail: {} as { sentry?: number; vercel?: number; slack?: string; heartbeat?: number; uptime?: number },
+    fail: {} as {
+      sentry?: number;
+      vercel?: number;
+      slack?: string;
+      slackUpdate?: string;
+      heartbeat?: number;
+      uptime?: number;
+    },
+    // 있으면 Slack이 보낸 메시지의 채널 id를 돌려준다(자동 해결 때 메시지를 고칠 수 있게).
+    slackChannelId: undefined as string | undefined,
     sentryEvents: {} as Record<string, unknown>,
     uptimeMonitors: [] as unknown[],
     uptimeNextLink: null as string | null,
   };
   const calls: string[] = [];
   const slack: { channel: string; text: string; body: string }[] = [];
+  const updates: { channel: string; ts: string; text: string; body: string }[] = [];
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
   const impl: typeof fetch = async (input, init) => {
@@ -123,12 +133,21 @@ function world() {
       calls.push("slack");
       if (state.fail.slack) return json({ ok: false, error: state.fail.slack });
       const body = JSON.parse(String(init?.body));
+      if (url.pathname === "/api/chat.update") {
+        updates.push({ channel: body.channel, ts: body.ts, text: body.text, body: JSON.stringify(body.blocks) });
+        if (state.fail.slackUpdate) return json({ ok: false, error: state.fail.slackUpdate });
+        return json({ ok: true, channel: body.channel, ts: body.ts });
+      }
       slack.push({ channel: body.channel, text: body.text, body: JSON.stringify(body.blocks) });
-      return json({ ok: true, ts: `1700000000.${String(slack.length).padStart(6, "0")}` });
+      return json({
+        ok: true,
+        ts: `1700000000.${String(slack.length).padStart(6, "0")}`,
+        ...(state.slackChannelId ? { channel: state.slackChannelId } : {}),
+      });
     }
     throw new Error(`예상하지 못한 요청: ${url.hostname}`);
   };
-  return { state, calls, slack, impl };
+  return { state, calls, slack, updates, impl };
 }
 
 describe("runCollect", () => {
@@ -168,9 +187,10 @@ describe("runCollect", () => {
       { target: "site-a", step: "sentry", ok: true, received: 1, skipped: 0 },
       { target: "site-a", step: "sentry-status", ok: true },
       { target: "site-a", step: "slack", ok: true },
+      { target: "site-a", step: "slack-update", ok: true },
     ]);
     expect(result.ingested.created).toBe(2);
-    expect(result.delivered).toEqual({ detailed: 2, bundled: 0, skipped: 0, analyzed: 0, analysisFailed: 0 });
+    expect(result.delivered).toEqual({ detailed: 2, bundled: 0, skipped: 0, analyzed: 0, analysisFailed: 0, updated: 0 });
     expect(w.slack.map((m) => m.channel)).toEqual(["#ops-a", "#ops-a"]);
     expect(w.slack[0].text).toContain("[P1][사이트 A] 배포 실패 (BUILD_FAILED)");
     expect(result.heartbeat).toBe("sent");
@@ -223,6 +243,7 @@ describe("runCollect", () => {
       { target: "site-a", step: "vercel", ok: true, received: 1, skipped: 0 },
       { target: "site-a", step: "sentry", ok: false, reason: "server" },
       { target: "site-a", step: "slack", ok: true },
+      { target: "site-a", step: "slack-update", ok: true },
     ]);
     // 수집이 실패했으니 Sentry 해결 확인도 하지 않는다
     expect(w.calls.filter((c) => c.startsWith("sentry:status") || c.startsWith("sentry:event"))).toEqual([]);
@@ -387,7 +408,7 @@ describe("runCollect", () => {
     w.state.fail.slack = "invalid_auth";
 
     const first = await runCollect(deps("01:00"));
-    expect(first.steps.at(-1)).toEqual({ target: "site-a", step: "slack", ok: false, reason: "auth" });
+    expect(first.steps.find((s) => s.step === "slack")).toEqual({ target: "site-a", step: "slack", ok: false, reason: "auth" });
     expect(first.heartbeat).toBe("sent");
 
     const later = await runCollect(deps("01:16"));
@@ -426,6 +447,25 @@ describe("runCollect", () => {
     ]);
   });
 
+  it("Sentry에서 닫힌 incident의 알림 메시지를 이유에 맞게 고친다", async () => {
+    w.state.slackChannelId = "C0OPSA1";
+    w.state.sentryIssues = ["101", "102", "103", "104"].map((id) => sentryIssue(id));
+    await runCollect(deps("01:00"));
+    expect(w.slack).toHaveLength(4);
+
+    w.state.sentryIssues = [];
+    w.state.sentryStatus = { "101": "resolved", "102": "ignored", "103": 404, "104": "unresolved" };
+    const result = await runCollect(deps("01:05"));
+
+    expect(result.delivered.updated).toBe(3);
+    expect(w.updates.map(({ text }) => text).sort()).toEqual([
+      "[P2][사이트 A] Sentry에서 무시됨 · 11/09 10:05",
+      "[P2][사이트 A] Sentry에서 사라져 닫음 · 11/09 10:05",
+      "[P2][사이트 A] Sentry에서 해결됨 · 11/09 10:05",
+    ]);
+    expect(new Set(w.updates.map(({ channel }) => channel))).toEqual(new Set(["C0OPSA1"]));
+  });
+
   it("열린 incident가 많으면 실행마다 나눠서 모두 확인한다", async () => {
     const ids = Array.from({ length: 12 }, (_, i) => String(200 + i));
     w.state.sentryIssues = ids.map((id) => sentryIssue(id));
@@ -447,7 +487,7 @@ describe("runCollect", () => {
     w.state.deployments = [deployment("dpl_9", "ERROR")];
     const result = await runCollect(deps("01:00", { targets: [NO_SENTRY], sentry: null }));
 
-    expect(result.steps.map((s) => s.step)).toEqual(["vercel", "slack"]);
+    expect(result.steps.map((s) => s.step)).toEqual(["vercel", "slack", "slack-update"]);
     expect(w.calls.filter((c) => c.startsWith("sentry"))).toEqual([]);
     expect(w.slack.map((m) => m.channel)).toEqual(["#ops-b"]);
     expect(result.heartbeat).toBe("sent");
@@ -478,7 +518,7 @@ describe("runCollect", () => {
       });
 
     const result = await runCollect(deps("01:00", { fetchImpl: slow, budgetMs: 20 }));
-    expect(result.steps.filter((s) => s.step !== "slack").every((s) => !s.ok)).toBe(true);
+    expect(result.steps.filter((s) => !s.step.startsWith("slack")).every((s) => !s.ok)).toBe(true);
     expect(result.steps[0].reason).toBe("network");
     expect(result.heartbeat).toBe("skipped");
     expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
@@ -512,8 +552,8 @@ describe("runCollect", () => {
           startedAt: at("01:00").toISOString(),
           finishedAt: expect.not.stringMatching(/^2026-11-09T01:00:00\.000Z$/),
           status: "done",
-          stepsOk: 3,
-          stepsTotal: 4,
+          stepsOk: 4,
+          stepsTotal: 5,
           heartbeat: "skipped",
         },
       ]);
@@ -537,7 +577,7 @@ describe("runCollect", () => {
         runCollect(deps("01:00", { db: failingDb(db, "batch", "DELETE FROM incidents") })),
       ).rejects.toThrow("db down");
 
-      expect(await runs()).toMatchObject([{ caller: "cron", status: "failed", stepsTotal: 4 }]);
+      expect(await runs()).toMatchObject([{ caller: "cron", status: "failed", stepsTotal: 5 }]);
       expect(await acquireLock(db, "collect", "other-run", at("01:00"))).toBe(true);
     });
 
@@ -776,6 +816,104 @@ describe("runCollect", () => {
       w.state.uptimeMonitors = after;
       const result = await runCollect(watchDeps("01:05"));
       expect(result.ingested.resolved).toBe(resolved);
+    });
+
+    describe("자동 해결 때 다운 알림 메시지 고치기", () => {
+      beforeEach(() => {
+        w.state.slackChannelId = "C0OPSA1";
+      });
+
+      it("회복하면 다운 알림의 버튼을 없애고 '회복 확인'으로 고친다. 한 번만 고친다", async () => {
+        w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+        await runCollect(watchDeps("01:00"));
+        expect(w.slack).toHaveLength(1);
+
+        w.state.uptimeMonitors = [uptimeMonitor(10, "UP")];
+        const recovered = await runCollect(watchDeps("01:05"));
+
+        expect(recovered.ingested.resolved).toBe(1);
+        expect(recovered.delivered.updated).toBe(1);
+        expect(recovered.steps).toContainEqual({ target: "site-a", step: "slack-update", ok: true });
+        expect(w.updates).toEqual([
+          {
+            channel: "C0OPSA1",
+            ts: "1700000000.000001",
+            text: "[P1][사이트 A] 회복 확인 · 11/09 10:05",
+            body: expect.stringContaining("회복 확인 · 11/09 10:05 · 자동 처리"),
+          },
+        ]);
+        expect(w.updates[0].body).not.toContain('"type":"actions"');
+        expect(w.slack).toHaveLength(1);
+        expect(recovered.heartbeat).toBe("sent");
+
+        await runCollect(watchDeps("01:10"));
+        expect(w.updates).toHaveLength(1);
+      });
+
+      it.each([
+        ["멈춤(PAUSED)", [uptimeMonitor(10, "PAUSED")], "감시를 멈춰 닫음"],
+        ["목록에서 사라짐", [], "감시가 없어져 닫음"],
+      ])("%s이면 '%s' 문구로 고친다", async (_label, after, label) => {
+        w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+        await runCollect(watchDeps("01:00"));
+        w.state.uptimeMonitors = after;
+        await runCollect(watchDeps("01:05"));
+        expect(w.updates.map(({ text }) => text)).toEqual([`[P1][사이트 A] ${label} · 11/09 10:05`]);
+      });
+
+      it("고치기가 일시적으로 실패하면 단계만 실패로 남기고(heartbeat는 보냄) 다음 실행이 다시 고친다", async () => {
+        w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+        await runCollect(watchDeps("01:00"));
+        w.state.uptimeMonitors = [uptimeMonitor(10, "UP")];
+        w.state.fail.slackUpdate = "ratelimited";
+
+        const failed = await runCollect(watchDeps("01:05"));
+        expect(failed.steps).toContainEqual({ target: "site-a", step: "slack-update", ok: false, reason: "rate_limit" });
+        expect(failed.heartbeat).toBe("sent");
+
+        w.state.fail.slackUpdate = undefined;
+        const retried = await runCollect(watchDeps("01:10"));
+        expect(retried.delivered.updated).toBe(1);
+        expect(w.updates).toHaveLength(2);
+        // 닫힌 시각(01:05)을 적는다. 다시 고친 시각이 아니다.
+        expect(w.updates[1].text).toBe("[P1][사이트 A] 회복 확인 · 11/09 10:05");
+      });
+
+      it("[리뷰 P2] 한 사이트에서 rate limit이 나면 남은 사이트도 이번 실행에서는 부르지 않는다", async () => {
+        const second: Target = { ...NO_SENTRY, uptime: { hosts: ["site-b.example"] } };
+        const both = (time: string) => watchDeps(time, { targets: [WATCHED, second] });
+        w.state.uptimeMonitors = [
+          uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z"),
+          { ...uptimeMonitor(20, "DOWN", "2026-11-09T00:58:00.000Z"), url: "https://site-b.example/" },
+        ];
+        await runCollect(both("01:00"));
+        w.state.uptimeMonitors = [uptimeMonitor(10, "UP"), { ...uptimeMonitor(20, "UP"), url: "https://site-b.example/" }];
+        w.state.fail.slackUpdate = "ratelimited";
+
+        const limited = await runCollect(both("01:05"));
+
+        expect(w.updates).toHaveLength(1);
+        expect(limited.steps.filter(({ step }) => step === "slack-update")).toEqual([
+          { target: "site-a", step: "slack-update", ok: false, reason: "rate_limit" },
+          { target: "site-b", step: "slack-update", ok: false, reason: "rate_limit" },
+        ]);
+
+        w.state.fail.slackUpdate = undefined;
+        const retried = await runCollect(both("01:10"));
+        expect(retried.delivered.updated).toBe(2);
+      });
+
+      it("메시지가 지워졌으면 포기하고 다시 하지 않는다", async () => {
+        w.state.uptimeMonitors = [uptimeMonitor(10, "DOWN", "2026-11-09T00:57:00.000Z")];
+        await runCollect(watchDeps("01:00"));
+        w.state.uptimeMonitors = [uptimeMonitor(10, "UP")];
+        w.state.fail.slackUpdate = "message_not_found";
+
+        const dropped = await runCollect(watchDeps("01:05"));
+        expect(dropped.steps).toContainEqual({ target: "site-a", step: "slack-update", ok: true });
+        await runCollect(watchDeps("01:10"));
+        expect(w.updates).toHaveLength(1);
+      });
     });
 
     it("목록은 실행당 한 번만 읽고 사이트마다 나눈다", async () => {
