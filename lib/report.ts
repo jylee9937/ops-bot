@@ -8,17 +8,22 @@ import {
 } from "./analysis";
 import {
   claimPending,
+  clearResolveNotice,
+  clearStaleNotices,
   completeNotification,
   completeNotifications,
   findCorrelatedTargets,
   getClaimedIncident,
   getIncident,
   listClaimed,
+  listResolveNotices,
+  markNoticeTried,
   muteIncident,
   releaseClaim,
   resolveIncident,
   saveAnalysis,
   type Incident,
+  type ResolveNotice,
   type StoredAnalysis,
 } from "./incidents";
 import type { MaskedFrame } from "./mask";
@@ -34,6 +39,7 @@ import {
   type ButtonElement,
   type Interaction,
   type SlackBlock,
+  type SlackErrorReason,
   type SlackMessage,
   type SlackResponse,
 } from "./slack";
@@ -50,6 +56,10 @@ export const MUTE_LONG_MS = 30 * 24 * 60 * 60_000;
 export const SEND_INTERVAL_MS = 1_100;
 /** Slack이 알려 준 대기 시간이 이보다 길면 기다리지 않고 다음 실행에 맡긴다. */
 export const MAX_RETRY_WAIT_MS = 10_000;
+/** 실행당 사이트마다 자동 해결로 고치는 메시지 수. 남은 건 다음 실행이 고친다. */
+export const NOTICE_LIMIT = 5;
+/** 이보다 오래전에 닫힌 incident의 메시지는 고치지 않고 포기한다(Slack이 계속 실패할 때 끝없이 다시 하지 않게). */
+export const NOTICE_MAX_AGE_MS = 24 * 60 * 60_000;
 /** Claude 호출을 시작하려면 호출 제한 시간에 더해 이만큼 남아 있어야 한다(상세·묶음 전송 몫). */
 export const ANALYSIS_SEND_RESERVE_MS = 15_000;
 /** 두 사이트가 함께 쓰는 플랫폼의 상태 페이지. 같은 시각 다른 사이트에도 에러가 있으면 붙인다(D22). */
@@ -74,12 +84,25 @@ const MAX_LINK_LENGTH = 1_000;
 const KST_OFFSET_MS = 9 * 60 * 60_000;
 const SEVERITY_ORDER: Record<Severity, number> = { P1: 0, P2: 1, P3: 2 };
 
-export type Send = (message: SlackMessage) => Promise<{ ts: string }>;
+/** 메시지를 보내고 위치를 돌려준다. `channel`(채널 id)이 있어야 나중에 그 메시지를 고친다. */
+export type Send = (message: SlackMessage) => Promise<{ ts: string; channel?: string | null }>;
+/** 보낸 메시지를 고친다. */
+export type Update = (location: { channel: string; ts: string }, message: SlackMessage) => Promise<void>;
 
-/** 버튼을 누른 뒤 원래 메시지에 남기는 상태. 버튼은 없앤다. */
+/** 원래 메시지에 남기는 상태(버튼을 누른 뒤나 자동으로 닫힌 뒤). 버튼은 없앤다. */
 export type IncidentState =
   | { kind: "resolved"; at: Date; by: string }
-  | { kind: "muted"; until: Date; by: string };
+  | { kind: "muted"; until: Date; by: string }
+  | { kind: "auto_resolved"; at: Date; notice: ResolveNotice };
+
+const NOTICE_LABEL: Record<ResolveNotice, string> = {
+  recovered: "회복 확인",
+  monitor_paused: "감시를 멈춰 닫음",
+  monitor_missing: "감시가 없어져 닫음",
+  sentry_resolved: "Sentry에서 해결됨",
+  sentry_ignored: "Sentry에서 무시됨",
+  sentry_missing: "Sentry에서 사라져 닫음",
+};
 
 /** `MM/DD HH:mm`(KST). */
 export function kst(iso: string | Date): string {
@@ -222,10 +245,13 @@ function buttons(incident: Incident): ButtonElement[] {
 }
 
 function stateSummary(state: IncidentState): string {
-  return state.kind === "resolved" ? `해결 처리 · ${kst(state.at)}` : `${kst(state.until)}까지 음소거`;
+  if (state.kind === "resolved") return `해결 처리 · ${kst(state.at)}`;
+  if (state.kind === "muted") return `${kst(state.until)}까지 음소거`;
+  return `${NOTICE_LABEL[state.notice]} · ${kst(state.at)}`;
 }
 
 function stateLine(state: IncidentState): string {
+  if (state.kind === "auto_resolved") return `${stateSummary(state)} · 자동 처리`;
   const by = isSlackUserId(state.by) ? ` · <@${state.by}>` : "";
   return `${stateSummary(state)}${by}`;
 }
@@ -242,7 +268,7 @@ export type MessageOptions = {
 /**
  * incident 하나의 상세 메시지. P1이면 담당자를 멘션한다.
  * 제목 → Claude 요약(있으면) → 규칙이 모은 근거 → 버튼. 등급·알림 여부는 규칙이 정하고 요약은 참고용이다.
- * `state`가 있으면 버튼 대신 처리 결과를 적는다(버튼을 누른 뒤 원래 메시지를 바꿀 때).
+ * `state`가 있으면 버튼 대신 처리 결과를 적는다(버튼을 누른 뒤나 자동으로 닫힌 뒤 원래 메시지를 바꿀 때).
  */
 export function incidentMessage(
   target: Target,
@@ -459,7 +485,7 @@ async function sendWithRetry(
   message: SlackMessage,
   sleep: (ms: number) => Promise<void>,
   shouldStop: (afterMs?: number) => boolean,
-): Promise<{ ts: string }> {
+): ReturnType<Send> {
   try {
     return await send(message);
   } catch (error) {
@@ -545,8 +571,8 @@ export async function deliverPending(
         sites,
         analysisFailure: failures.get(incident.id) ?? null,
       });
-      const { ts } = await paced(message);
-      await completeNotification(db, incident.id, claim, ts, now);
+      const { ts, channel } = await paced(message);
+      await completeNotification(db, incident.id, claim, ts, now, channel ?? null);
       result.detailed++;
     }
 
@@ -573,6 +599,103 @@ export async function deliverPending(
     else throw error;
   } finally {
     await releaseClaim(db, claim);
+  }
+  return result;
+}
+
+export type NoticeResult = {
+  // 고친 메시지 수
+  updated: number;
+  // 고치지 않고 포기한 수(메시지·채널이 없어졌거나, 내용이 거절됐거나, 닫힌 지 하루가 지남)
+  dropped: number;
+  // 이 메시지만 실패해 다음 실행에 다시 고칠 수
+  kept: number;
+  // 이 메시지만의 문제가 아닌 실패(인증·rate limit·Slack 장애·네트워크)나 예산 종료. 이번 실행의 고치기를 멈췄다.
+  error: unknown;
+};
+
+// 다시 해도 같은 결과인 실패. 메시지나 채널이 없어졌거나, 우리가 만든 내용이 거절됐다.
+const DROP_REASONS = new Set<SlackErrorReason>(["message", "channel"]);
+const DROP_CODES = new Set(["invalid_blocks", "invalid_blocks_format", "msg_too_long", "no_text", "invalid_arguments"]);
+// 이 메시지만의 문제가 아니다. rate limit은 앱·메서드 단위라 다른 메시지·사이트도 이번 실행에서는 부르지 않는다.
+const STOP_REASONS = new Set<SlackErrorReason>(["auth", "rate_limit", "server", "network", "invalid_response"]);
+
+function updateFailure(error: unknown): "drop" | "stop" | "keep" {
+  if (!(error instanceof SlackError)) return "stop";
+  if (DROP_REASONS.has(error.reason)) return "drop";
+  if (error.reason === "bad_request" && error.code && DROP_CODES.has(error.code)) return "drop";
+  if (STOP_REASONS.has(error.reason)) return "stop";
+  return "keep";
+}
+
+/** 목록을 읽은 뒤에도 같은 메시지를 같은 이유로 고칠 차례인지. 그사이 음소거·재개방됐으면 아니다. */
+function stillPending(listed: Incident, current: Incident | null): current is Incident {
+  return (
+    current !== null &&
+    current.status === "resolved" &&
+    current.resolveNotice !== null &&
+    current.resolveNotice === listed.resolveNotice &&
+    current.episode === listed.episode &&
+    current.slackTs === listed.slackTs &&
+    current.slackChannel === listed.slackChannel
+  );
+}
+
+/**
+ * 자동으로 닫힌 incident의 상세 메시지를 고친다. 버튼을 없애고 닫힌 이유·시각을 적는다.
+ * 고치거나 포기하면 표시를 지운다. 이 메시지만의 실패면 남겨 두고 다음 것을 고친다.
+ * Slack 자체가 막히면(인증·rate limit·장애) 남겨 두고 멈춘다. 다음 실행이 다시 고친다.
+ * 닫힌 지 하루가 지난 것은 고치지 않는다. 묶음 메시지는 위치(채널 id)를 남기지 않아 여기 오지 않는다.
+ * 남은 한계: 이 요청과 음소거 버튼 응답이 거의 같은 순간(요청 하나가 오가는 사이)에 겹치면 Slack에 나중에 닿은 쪽이
+ * 화면에 남는다. 음소거 자체는 DB에 그대로 유효하고, 어느 쪽이 남아도 '닫힘'과 '음소거' 모두 사실이다.
+ */
+export async function updateResolvedMessages(
+  db: Client,
+  target: Target,
+  now: Date,
+  update: Update,
+  { sleep = wait, shouldStop = () => false, sites = [] }: Pick<DeliveryOptions, "sleep" | "shouldStop" | "sites"> = {},
+): Promise<NoticeResult> {
+  const result: NoticeResult = { updated: 0, dropped: 0, kept: 0, error: null };
+  result.dropped += await clearStaleNotices(db, target.id, new Date(now.getTime() - NOTICE_MAX_AGE_MS));
+
+  let sentBefore = false;
+  for (const listed of await listResolveNotices(db, target.id, NOTICE_LIMIT, now)) {
+    if (sentBefore) await sleep(SEND_INTERVAL_MS);
+    if (shouldStop()) {
+      result.error = new DeliveryStopped();
+      break;
+    }
+    // 목록을 읽은 뒤(앞 메시지를 고치는 사이) 음소거 버튼을 눌렀거나 다시 열렸을 수 있다. 고치기 직전에 다시 읽는다.
+    const incident = await getIncident(db, listed.id);
+    if (!stillPending(listed, incident)) continue;
+    const { slackChannel: channel, slackTs: ts, resolveNotice: notice, resolvedAt } = incident;
+    if (!channel || !ts || !notice || !resolvedAt) continue;
+
+    sentBefore = true;
+    const message = incidentMessage(target, incident, {
+      state: { kind: "auto_resolved", at: new Date(resolvedAt), notice },
+      sites,
+    });
+    try {
+      await update({ channel, ts }, message);
+    } catch (error) {
+      const failure = updateFailure(error);
+      if (failure === "stop") {
+        result.error = error;
+        break;
+      }
+      if (failure === "keep") {
+        await markNoticeTried(db, incident, now);
+        result.kept++;
+        continue;
+      }
+      await clearResolveNotice(db, incident);
+      result.dropped++;
+      continue;
+    }
+    await clearResolveNotice(db, incident);
+    result.updated++;
   }
   return result;
 }

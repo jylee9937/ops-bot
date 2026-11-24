@@ -10,6 +10,7 @@ import {
   readSlackRequest,
   respond,
   SlackError,
+  updateMessage,
   verifySlackSignature,
   type SlackMessage,
 } from "./slack";
@@ -80,6 +81,42 @@ describe("verifySlackSignature", () => {
   });
 });
 
+describe("updateMessage", () => {
+  const LOCATION = { channel: "C0OPSA1", ts: "1700000000.000100" };
+
+  it("chat.update로 채널 id·ts·본문을 보내고 자동 링크를 끈다", async () => {
+    const fake = fakeFetch([jsonResponse({ ok: true, channel: "C0OPSA1", ts: "1700000000.000100" })]);
+    let sent: Record<string, unknown> = {};
+    const impl: typeof fetch = async (input, init) => {
+      sent = JSON.parse(String(init?.body));
+      return fake.impl(input, init);
+    };
+
+    await updateMessage(LOCATION, MESSAGE, TOKEN, { fetchImpl: impl });
+
+    expect(fake.urls[0].href).toBe("https://slack.com/api/chat.update");
+    expect(fake.authorization).toEqual([`Bearer ${TOKEN}`]);
+    expect(sent).toEqual({ ...LOCATION, text: MESSAGE.text, blocks: MESSAGE.blocks, parse: "none" });
+  });
+
+  it.each([
+    ["message_not_found", "message"],
+    ["cant_update_message", "message"],
+    ["edit_window_closed", "message"],
+    ["channel_not_found", "channel"],
+    ["missing_scope", "auth"],
+    ["ratelimited", "rate_limit"],
+    ["internal_error", "server"],
+    ["fatal_error", "server"],
+    ["update_failed", "server"],
+    ["external_channel_migrating", "server"],
+    ["invalid_blocks", "bad_request"],
+  ])("Slack 오류 %s는 %s 실패다", async (code, reason) => {
+    const fake = fakeFetch([jsonResponse({ ok: false, error: code })]);
+    await expect(updateMessage(LOCATION, MESSAGE, TOKEN, { fetchImpl: fake.impl })).rejects.toMatchObject({ reason, code });
+  });
+});
+
 describe("postMessage", () => {
   it("미리보기와 자동 링크를 끄고 보낸다", async () => {
     let sent: Record<string, unknown> = {};
@@ -90,6 +127,7 @@ describe("postMessage", () => {
 
     await expect(postMessage(MESSAGE, TOKEN, { fetchImpl: impl })).resolves.toEqual({
       ts: "1700000000.000100",
+      channel: null,
     });
     expect(sent).toMatchObject({
       channel: "#ops-a",
@@ -97,6 +135,16 @@ describe("postMessage", () => {
       unfurl_links: false,
       unfurl_media: false,
     });
+  });
+
+  it.each([
+    ["C0OPSA1", "C0OPSA1"],
+    ["G0PRIV01", "G0PRIV01"],
+    ["#ops-a", null],
+    [undefined, null],
+  ])("Slack이 돌려준 채널 %s를 id로 남긴다(형식이 다르면 null)", async (channel, expected) => {
+    const fake = fakeFetch([jsonResponse({ ok: true, ts: "1.2", channel })]);
+    await expect(postMessage(MESSAGE, TOKEN, { fetchImpl: fake.impl })).resolves.toEqual({ ts: "1.2", channel: expected });
   });
 
   it("토큰은 Authorization 헤더로만 보낸다", async () => {

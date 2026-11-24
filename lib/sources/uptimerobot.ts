@@ -170,13 +170,21 @@ export function uptimeSignals(targetId: string, monitors: readonly UptimeMonitor
   });
 }
 
+/** 열린 incident를 닫는 이유. 다시 UP · 멈춤 · 목록에서 사라짐. */
+export type UptimeRecovery = "recovered" | "monitor_paused" | "monitor_missing";
+
 /**
- * 열린 incident를 닫아도 되는지. 감시가 다시 UP이거나 멈췄으면 닫는다.
+ * 열린 incident를 닫아도 되는지와 그 이유. 닫지 않으면 null. 감시가 다시 UP이거나 멈췄으면 닫는다.
  * 목록에 없으면(지웠거나 다른 호스트로 바꿈) 목록을 빠짐없이 읽었을 때만 닫는다.
  * 다 못 읽었거나 형식이 달라 건너뛴 항목이 있으면, 없는 것이 삭제인지 건너뛴 것인지 알 수 없다.
  * 준비 중(`STARTED`) 같은 그 밖의 상태는 그대로 둔다.
  */
-export function isRecovered(monitor: UptimeMonitor | undefined, list: Pick<UptimeList, "complete" | "skipped">): boolean {
-  if (!monitor) return list.complete && list.skipped === 0;
-  return monitor.status === "UP" || monitor.status === "PAUSED";
+export function recoveryOf(
+  monitor: UptimeMonitor | undefined,
+  list: Pick<UptimeList, "complete" | "skipped">,
+): UptimeRecovery | null {
+  if (!monitor) return list.complete && list.skipped === 0 ? "monitor_missing" : null;
+  if (monitor.status === "UP") return "recovered";
+  if (monitor.status === "PAUSED") return "monitor_paused";
+  return null;
 }

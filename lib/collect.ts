@@ -24,16 +24,22 @@ import {
   saveCursor,
   type CollectRun,
   type IngestSummary,
+  type ResolveNotice,
   type RunCaller,
 } from "./incidents";
-import { deliverPending } from "./report";
-import { postMessage, SlackError } from "./slack";
-import { collectSentry, fetchSentryFrames, fetchSentryIssueStatus } from "./sources/sentry";
+import { deliverPending, updateResolvedMessages } from "./report";
+import { postMessage, SlackError, updateMessage } from "./slack";
+import {
+  collectSentry,
+  fetchSentryFrames,
+  fetchSentryIssueStatus,
+  type SentryIssueStatus,
+} from "./sources/sentry";
 import { SourceError, type RequestOptions } from "./sources/shared";
 import {
   fetchUptimeMonitors,
-  isRecovered,
   monitorsFor,
+  recoveryOf,
   uptimeSignals,
   type UptimeList,
 } from "./sources/uptimerobot";
@@ -55,7 +61,15 @@ const FRAMES_TIMEOUT_MS = 5_000;
 // 실행 기록은 보조 정보다. 늦으면 기다리지 않고 결과를 돌려준다(route 제한 시간 안에 끝나게).
 const RECORD_TIMEOUT_MS = 5_000;
 
-export type Step = "vercel" | "sentry" | "sentry-status" | "uptime" | "slack";
+export type Step = "vercel" | "sentry" | "sentry-status" | "uptime" | "slack" | "slack-update";
+// Slack 단계. 실패해도 바로 heartbeat를 막지 않는다(못 보낸 알림이 15분 넘게 쌓이면 막는다).
+const SLACK_STEPS: readonly Step[] = ["slack", "slack-update"];
+// Sentry에서 닫힌 상태와 Slack 메시지에 적을 이유. 그 밖의 상태는 닫지 않는다.
+const SENTRY_CLOSED: Partial<Record<SentryIssueStatus, ResolveNotice>> = {
+  resolved: "sentry_resolved",
+  ignored: "sentry_ignored",
+  missing: "sentry_missing",
+};
 /**
  * 수집 단계는 받아들인 항목 수(`received`, Sentry는 에러 issue만)와 형식이 달라 건너뛴 수를 함께 남긴다.
  * 건너뛴 항목이 있으면 그 단계는 실패로 보고 커서도 옮기지 않는다. 외부 응답 형식이 바뀌어
@@ -75,7 +89,15 @@ export type CollectResult = {
   status: "done" | "locked";
   steps: StepResult[];
   ingested: IngestSummary;
-  delivered: { detailed: number; bundled: number; skipped: number; analyzed: number; analysisFailed: number };
+  // updated: 자동으로 닫혀 고친 메시지 수
+  delivered: {
+    detailed: number;
+    bundled: number;
+    skipped: number;
+    analyzed: number;
+    analysisFailed: number;
+    updated: number;
+  };
   heartbeat: "sent" | "skipped" | "failed" | "disabled";
 };
 
@@ -130,7 +152,7 @@ export function rotate<T>(items: readonly T[], now: Date, limit: number): T[] {
 
 /**
  * 5분마다 한 번: 잠금 → 사이트마다 Vercel 배포 기록·배포 실패 → Sentry issue → Sentry 해결 확인
- * → Slack 전송 → 보관 기간 정리 → heartbeat → 잠금 해제.
+ * → Slack 전송 → 자동으로 닫힌 알림 메시지 고치기 → 보관 기간 정리 → heartbeat → 잠금 해제.
  * 출처 하나가 실패해도 나머지는 계속한다. 실패한 출처는 커서를 옮기지 않아 다음 실행이 다시 읽는다.
  * heartbeat는 모든 수집 단계가 성공하고 15분 넘게 못 보낸 알림이 없을 때만 보낸다(D21).
  * 끝나면(잠금에 막혀도) 실행 결과 한 줄을 남긴다. 잠금을 먼저 풀고 남기며, 기록이 실패하거나
@@ -148,7 +170,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
     status: "done",
     steps: [],
     ingested: emptySummary(),
-    delivered: { detailed: 0, bundled: 0, skipped: 0, analyzed: 0, analysisFailed: 0 },
+    delivered: { detailed: 0, bundled: 0, skipped: 0, analyzed: 0, analysisFailed: 0, updated: 0 },
     heartbeat: "skipped",
   };
 
@@ -246,8 +268,9 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
             const checkable = open.filter((incident) => SENTRY_ISSUE_ID.test(incident.evidence.sourceId));
             for (const incident of rotate(checkable, now, STATUS_CHECK_LIMIT)) {
               const status = await fetchSentryIssueStatus(sentry, incident.evidence.sourceId, request);
-              if (status !== "resolved" && status !== "ignored" && status !== "missing") continue;
-              if (await resolveIncident(db, target.id, incident.fingerprint, now, incident.episode)) {
+              const notice = SENTRY_CLOSED[status];
+              if (!notice) continue;
+              if (await resolveIncident(db, target.id, incident.fingerprint, now, incident.episode, notice)) {
                 result.ingested.resolved++;
               }
             }
@@ -267,8 +290,9 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
           // 다시 UP이 됐거나 멈췄거나 목록에서 사라진 감시의 열린 incident를 닫는다.
           const byId = new Map(mine.map((monitor) => [String(monitor.id), monitor]));
           for (const incident of await listOpenUptimeIncidents(db, target.id, MAX_OPEN_SCAN)) {
-            if (!isRecovered(byId.get(incident.evidence.sourceId), list)) continue;
-            if (await resolveIncident(db, target.id, incident.fingerprint, now, incident.episode)) {
+            const notice = recoveryOf(byId.get(incident.evidence.sourceId), list);
+            if (!notice) continue;
+            if (await resolveIncident(db, target.id, incident.fingerprint, now, incident.episode, notice)) {
               result.ingested.resolved++;
             }
           }
@@ -291,6 +315,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
 
     // 모든 사이트를 수집한 뒤 보낸다. Slack 간격·재시도 대기가 뒤 사이트의 수집 예산을 먹지 않게 한다.
     // 보내는 중인 전송에는 실행 예산의 끊기 신호를 걸지 않고(자체 10초 제한만), 새 전송 전에만 예산을 본다.
+    const shouldStop = (afterMs = 0) => Date.now() + afterMs >= deadline;
     for (const target of targets) {
       const sentryTarget = target.sentry;
       await run(target, "slack", async () => {
@@ -302,7 +327,7 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
           {
             ownerUserId: slack.ownerUserId,
             sleep: deps.sleep,
-            shouldStop: (afterMs = 0) => Date.now() + afterMs >= deadline,
+            shouldStop,
             analyzer,
             sites: targets,
             frames:
@@ -330,10 +355,31 @@ export async function runCollect(deps: CollectDeps): Promise<CollectResult> {
       });
     }
 
+    // 자동으로 닫힌 incident의 원래 메시지를 고친다. 새 알림을 모든 사이트에 먼저 보낸 뒤에 한다.
+    // 한 사이트에서 Slack이 막히면(rate limit은 앱·메서드 단위) 남은 사이트도 이번 실행에서는 부르지 않는다.
+    let updateBlocked: unknown = null;
+    for (const target of targets) {
+      await run(target, "slack-update", async () => {
+        if (updateBlocked) throw updateBlocked;
+        const notices = await updateResolvedMessages(
+          db,
+          target,
+          now,
+          (location, message) => updateMessage(location, message, slack.token, { fetchImpl: deps.fetchImpl }),
+          { sleep: deps.sleep, shouldStop, sites: targets },
+        );
+        result.delivered.updated += notices.updated;
+        if (notices.error) {
+          updateBlocked = notices.error;
+          throw notices.error;
+        }
+      });
+    }
+
     await purgeExpired(db, now);
 
     // Slack 실패는 바로 heartbeat를 막지 않는다. 못 보낸 알림이 15분 넘게 쌓이면 막는다.
-    const collectedAll = result.steps.filter(({ step }) => step !== "slack").every(({ ok }) => ok);
+    const collectedAll = result.steps.filter(({ step }) => !SLACK_STEPS.includes(step)).every(({ ok }) => ok);
     if (!heartbeatUrl) {
       result.heartbeat = "disabled";
     } else if (!collectedAll || (await isDeliveryOverdue(db, now, targets.map(({ id }) => id)))) {
